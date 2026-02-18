@@ -16,3 +16,12 @@ tags=geozarr,zarr,stac,sentinel-2,cloud-native,raster
 category=Raster
 hasProcessingProvider=no
 about=Enhances the QGIS native STAC browser with GeoZarr (Zarr v3) features: band/resolution selection, satellite band presets (Sentinel-2, Landsat), multiscales convention support, and optimized GDAL configuration for cloud access. Requires GDAL 3.13+.
+
+changelog=
+    0.1.0 - Initial release
+    - STAC browser integration: right-click Zarr assets to load
+    - Band/resolution picker with satellite presets (Sentinel-2, Landsat 8/9, MODIS, Sentinel-3)
+    - Multiscales convention support (VRT overviews from coarser resolutions)
+    - Standalone URL loader with recent URL history
+    - Non-blocking metadata fetch
+    - Optimized GDAL config for cloud access (HTTP/2, vsicurl cache, parallel decode)
