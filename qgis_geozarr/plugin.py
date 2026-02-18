@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from qgis.core import Qgis, QgsSettings
 from qgis.gui import QgisInterface, QgsGui
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import Qt, QThread, pyqtSignal
 from qgis.PyQt.QtWidgets import (
     QAction,
     QApplication,
@@ -31,6 +32,21 @@ log = logging.getLogger(__name__)
 _MIN_GDAL = (3, 13)
 _SETTINGS_KEY = "GeoZarr/recent_urls"
 _MAX_RECENT = 10
+_URL_RE = re.compile(r"^https?://|^s3://", re.IGNORECASE)
+
+
+class _FetchThread(QThread):
+    """Background thread for zarr.json fetch."""
+
+    finished = pyqtSignal(object, str)  # (ZarrRootInfo | None, final_url)
+
+    def __init__(self, url: str):
+        super().__init__()
+        self.url = url
+
+    def run(self):
+        info, url = geozarr_metadata.fetch_resolved(self.url)
+        self.finished.emit(info, url)
 
 
 class GeoZarrPlugin:
@@ -39,6 +55,7 @@ class GeoZarrPlugin:
         self._provider = None
         self._toolbar = None
         self._action = None
+        self._fetch_thread = None
 
     def initGui(self) -> None:
         from osgeo import gdal
@@ -78,7 +95,13 @@ class GeoZarrPlugin:
         self._iface.addPluginToRasterMenu("GeoZarr", self._action)
 
     def unload(self) -> None:
+        if self._fetch_thread and self._fetch_thread.isRunning():
+            self._fetch_thread.finished.disconnect()
+            self._fetch_thread.wait(3000)
+        self._fetch_thread = None
+
         if self._provider:
+            self._provider.stop_fetch()
             QgsGui.dataItemGuiProviderRegistry().removeProvider(self._provider)
             self._provider = None
 
@@ -102,25 +125,21 @@ class GeoZarrPlugin:
         if not url:
             return
 
-        # Save to recent
         _save_recent_url(url)
 
         QApplication.setOverrideCursor(Qt.WaitCursor)
         self._iface.messageBar().pushMessage(
             "GeoZarr", "Fetching zarr.json...", Qgis.Info, 0
         )
-        try:
-            info = geozarr_metadata.fetch(url)
 
-            if info and info.sub_group and not info.epsg:
-                sub_url = f"{url}/{info.sub_group}"
-                sub_info = geozarr_metadata.fetch(sub_url)
-                if sub_info and sub_info.resolutions:
-                    url = sub_url
-                    info = sub_info
-        finally:
-            QApplication.restoreOverrideCursor()
-            self._iface.messageBar().clearWidgets()
+        self._fetch_thread = _FetchThread(url)
+        self._fetch_thread.finished.connect(self._on_url_fetch_done)
+        self._fetch_thread.start()
+
+    def _on_url_fetch_done(self, info, url) -> None:
+        """Handle completed metadata fetch."""
+        QApplication.restoreOverrideCursor()
+        self._iface.messageBar().clearWidgets()
 
         if info is None:
             QMessageBox.warning(
@@ -248,7 +267,7 @@ class _UrlDialog(QDialog):
         if not text:
             self._hint.setText("")
             self._ok_btn.setEnabled(False)
-        elif "http" in text.lower() or text.startswith("s3://"):
+        elif _URL_RE.match(text):
             self._hint.setText("")
             self._ok_btn.setEnabled(True)
         else:

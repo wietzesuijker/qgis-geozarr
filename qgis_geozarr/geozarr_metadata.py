@@ -81,6 +81,18 @@ def clear_cache() -> None:
         _cache.clear()
 
 
+def fetch_resolved(zarr_url: str) -> Tuple[Optional[ZarrRootInfo], str]:
+    """Fetch zarr.json and resolve sub-groups. Returns (info, final_url)."""
+    info = fetch(zarr_url)
+    url = zarr_url.rstrip("/")
+    if info and info.sub_group and not info.epsg:
+        sub_url = f"{url}/{info.sub_group}"
+        sub_info = fetch(sub_url)
+        if sub_info and sub_info.resolutions:
+            return sub_info, sub_url
+    return info, url
+
+
 def _parse(root: Dict[str, Any]) -> ZarrRootInfo:
     """Extract resolutions, bands, CRS, and transform from zarr.json."""
     bands_per_res: Dict[str, List[str]] = {}

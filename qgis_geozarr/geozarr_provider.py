@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import tempfile
+import threading
 import xml.etree.ElementTree as ET
 
 from osgeo import gdal, osr
@@ -20,27 +22,30 @@ from qgis.core import (
     QgsStacConnection,
 )
 from qgis.gui import QgsDataItemGuiProvider
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import Qt, QThread, pyqtSignal
 from qgis.PyQt.QtWidgets import QAction, QApplication, QMessageBox
 
 from . import geozarr_metadata
 from .geozarr_dialog import GeoZarrLoadDialog
 
 TAG = "GeoZarr"
+log = logging.getLogger(__name__)
 
 # Track temp VRT files for cleanup
 _temp_files: set = set()
+_temp_lock = threading.Lock()
 
 
 def cleanup_temp_files() -> None:
     """Remove all tracked temp VRT files."""
-    for path in list(_temp_files):
-        try:
-            if os.path.exists(path):
-                os.unlink(path)
-        except OSError:
-            pass
-    _temp_files.clear()
+    with _temp_lock:
+        for path in list(_temp_files):
+            try:
+                if os.path.exists(path):
+                    os.unlink(path)
+            except OSError:
+                pass
+        _temp_files.clear()
 
 
 def _find_zarr_root(url: str) -> str:
@@ -51,12 +56,66 @@ def _find_zarr_root(url: str) -> str:
     return url
 
 
+def _fetch_zarr_href(stac_item_url: str) -> tuple:
+    """Fetch a STAC item and find its Zarr asset href. Thread-safe."""
+    try:
+        vsi_path = f"/vsicurl/{stac_item_url}"
+        fp = gdal.VSIFOpenL(vsi_path, "rb")
+        if fp is None:
+            return ("", "")
+        data = b""
+        while True:
+            chunk = gdal.VSIFReadL(1, 65536, fp)
+            if not chunk:
+                break
+            data += chunk
+        gdal.VSIFCloseL(fp)
+        stac_item = json.loads(data)
+    except Exception:
+        log.debug("STAC item fetch failed: %s", stac_item_url, exc_info=True)
+        return ("", "")
+
+    assets = stac_item.get("assets", {})
+    for key, asset in assets.items():
+        if not isinstance(asset, dict):
+            continue
+        href = asset.get("href", "")
+        media = asset.get("type", "")
+        if "zarr" in media.lower() or ".zarr" in href.lower():
+            return (_find_zarr_root(href), key)
+
+    return ("", "")
+
+
+class _ProviderFetchThread(QThread):
+    """Background thread for STAC resolve + zarr.json fetch."""
+
+    finished = pyqtSignal(object, str)  # (ZarrRootInfo | None, zarr_url)
+
+    def __init__(self, zarr_url: str, stac_api_url: str = ""):
+        super().__init__()
+        self.zarr_url = zarr_url
+        self.stac_api_url = stac_api_url
+
+    def run(self):
+        zarr_url = self.zarr_url
+        if self.stac_api_url:
+            zarr_url, _ = _fetch_zarr_href(self.stac_api_url)
+            if not zarr_url:
+                self.finished.emit(None, "")
+                return
+        info, url = geozarr_metadata.fetch_resolved(zarr_url)
+        self.finished.emit(info, url)
+
+
 class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
     """Injects 'Load GeoZarr...' context menu on STAC Zarr assets."""
 
     def __init__(self, iface=None):
         super().__init__()
         self._iface = iface
+        self._fetch_thread = None
+        self._pending = {}
 
     def name(self) -> str:
         return "GeoZarr"
@@ -89,7 +148,7 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
                 if ".zarr" in raw.lower():
                     return _find_zarr_root(raw)
         except Exception:
-            pass
+            log.debug("Zarr detection via mimeUris failed", exc_info=True)
 
         try:
             path = item.path() or ""
@@ -97,7 +156,7 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
             if ".zarr" in path.lower() or ".zarr" in name.lower():
                 return self._zarr_from_parent(item)
         except Exception:
-            pass
+            log.debug("Zarr detection via path failed", exc_info=True)
 
         # Strategy 4: any STAC item - resolve via API when clicked
         try:
@@ -105,7 +164,7 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
             if "/items/" in path and "stac" in path.lower():
                 return f"STAC:{path}"
         except Exception:
-            pass
+            log.debug("STAC item detection failed", exc_info=True)
 
         return ""
 
@@ -135,7 +194,7 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
                             cleaned = cleaned[9:]
                         return _find_zarr_root(cleaned)
             except Exception:
-                pass
+                log.debug("Zarr parent walk failed", exc_info=True)
             parent = parent.parent()
         return ""
 
@@ -149,8 +208,8 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
             parent = parent.parent()
         return ""
 
-    def _resolve_stac_zarr_url(self, item: QgsDataItem) -> str:
-        """Resolve Zarr store URL from a STAC item via the STAC API."""
+    def _build_stac_api_url(self, item: QgsDataItem) -> str:
+        """Extract STAC API URL from data item tree (main thread only)."""
         path = item.path() or ""
         item_id, collection_id, conn_name = "", "", ""
 
@@ -187,45 +246,15 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
         try:
             conn_data = QgsStacConnection.connection(conn_name)
         except Exception:
+            log.debug("STAC connection lookup failed: %s", conn_name, exc_info=True)
             return ""
         if not conn_data or not conn_data.url:
             return ""
 
-        api_url = (
+        return (
             f"{conn_data.url.rstrip('/')}"
             f"/collections/{collection_id}/items/{item_id}"
         )
-
-        url, _key = self._fetch_zarr_href(api_url)
-        return url
-
-    def _fetch_zarr_href(self, stac_item_url: str) -> tuple:
-        try:
-            vsi_path = f"/vsicurl/{stac_item_url}"
-            fp = gdal.VSIFOpenL(vsi_path, "rb")
-            if fp is None:
-                return ("", "")
-            data = b""
-            while True:
-                chunk = gdal.VSIFReadL(1, 65536, fp)
-                if not chunk:
-                    break
-                data += chunk
-            gdal.VSIFCloseL(fp)
-            stac_item = json.loads(data)
-        except Exception:
-            return ("", "")
-
-        assets = stac_item.get("assets", {})
-        for key, asset in assets.items():
-            if not isinstance(asset, dict):
-                continue
-            href = asset.get("href", "")
-            media = asset.get("type", "")
-            if "zarr" in media.lower() or ".zarr" in href.lower():
-                return (_find_zarr_root(href), key)
-
-        return ("", "")
 
     def _stac_item_name(self, item: QgsDataItem) -> str:
         path = item.path() or ""
@@ -236,48 +265,59 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
         return item.name() or ""
 
     def _load_geozarr(self, item: QgsDataItem, zarr_url: str) -> None:
-        """Fetch metadata, show dialog, create layer."""
+        """Fetch metadata, show dialog, create layer (non-blocking)."""
         item_name = ""
+        stac_api_url = ""
 
+        if zarr_url.startswith("STAC:"):
+            item_name = self._stac_item_name(item)
+            stac_api_url = self._build_stac_api_url(item)
+            if not stac_api_url:
+                QMessageBox.warning(
+                    None,
+                    TAG,
+                    "No Zarr assets found in this STAC item.\n\n"
+                    "The item may use a different format (COG, NetCDF).",
+                )
+                return
+            zarr_url = ""
+
+        self._pending = {
+            "item_name": item_name,
+            "collection_id": self._extract_collection_id(item),
+        }
+
+        self._msg("Fetching zarr.json...")
         QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            # Resolve STAC sentinel value to actual URL
-            if zarr_url.startswith("STAC:"):
-                self._msg("Resolving STAC item...")
-                item_name = self._stac_item_name(item)
-                zarr_url = self._resolve_stac_zarr_url(item)
-                if not zarr_url:
-                    QApplication.restoreOverrideCursor()
-                    QMessageBox.warning(
-                        None,
-                        TAG,
-                        "No Zarr assets found in this STAC item.\n\n"
-                        "The item may use a different format (COG, NetCDF).",
-                    )
-                    return
 
-            self._msg("Fetching zarr.json...")
-            info = geozarr_metadata.fetch(zarr_url)
+        self._fetch_thread = _ProviderFetchThread(zarr_url, stac_api_url)
+        self._fetch_thread.finished.connect(self._on_fetch_done)
+        self._fetch_thread.start()
 
-            # If parser found bands under a sub-group, re-fetch
-            if info and info.sub_group and not info.epsg:
-                sub_url = f"{zarr_url}/{info.sub_group}"
-                sub_info = geozarr_metadata.fetch(sub_url)
-                if sub_info and sub_info.resolutions:
-                    zarr_url = sub_url
-                    info = sub_info
-        finally:
-            QApplication.restoreOverrideCursor()
-            self._msg_clear()
+    def _on_fetch_done(self, info, zarr_url) -> None:
+        """Handle completed metadata fetch (main thread)."""
+        QApplication.restoreOverrideCursor()
+        self._msg_clear()
+
+        item_name = self._pending.get("item_name", "")
+        collection_id = self._pending.get("collection_id", "")
 
         if info is None:
-            QMessageBox.warning(
-                None,
-                TAG,
-                f"Could not read zarr.json from:\n{zarr_url}\n\n"
-                "Check that the URL points to a Zarr v3 store root "
-                "(.zarr directory).",
-            )
+            if not zarr_url:
+                QMessageBox.warning(
+                    None,
+                    TAG,
+                    "No Zarr assets found in this STAC item.\n\n"
+                    "The item may use a different format (COG, NetCDF).",
+                )
+            else:
+                QMessageBox.warning(
+                    None,
+                    TAG,
+                    f"Could not read zarr.json from:\n{zarr_url}\n\n"
+                    "Check that the URL points to a Zarr v3 store root "
+                    "(.zarr directory).",
+                )
             return
 
         if not info.resolutions or not any(info.bands_per_resolution.values()):
@@ -289,8 +329,6 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
                 "band arrays. The dataset may not follow GeoZarr conventions.",
             )
             return
-
-        collection_id = self._extract_collection_id(item)
 
         dlg = GeoZarrLoadDialog(
             info,
@@ -317,6 +355,13 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
         finally:
             QApplication.restoreOverrideCursor()
             self._msg_clear()
+
+    def stop_fetch(self) -> None:
+        """Cancel any running fetch thread."""
+        if self._fetch_thread and self._fetch_thread.isRunning():
+            self._fetch_thread.finished.disconnect()
+            self._fetch_thread.wait(3000)
+        self._fetch_thread = None
 
 
 def _vsi_prefix(url: str) -> str:
@@ -359,7 +404,8 @@ def _overview_resolutions(base_res, bands, info) -> list:
 
 def _track_temp(path: str) -> str:
     """Register a temp file for cleanup and return the path."""
-    _temp_files.add(path)
+    with _temp_lock:
+        _temp_files.add(path)
     return path
 
 
