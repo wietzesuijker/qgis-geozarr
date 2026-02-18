@@ -36,7 +36,7 @@ _URL_RE = re.compile(r"^https?://|^s3://", re.IGNORECASE)
 
 
 class _FetchThread(QThread):
-    """Background thread for zarr.json fetch."""
+    """Background thread for metadata fetch."""
 
     finished = pyqtSignal(object, str)  # (ZarrRootInfo | None, final_url)
 
@@ -129,7 +129,7 @@ class GeoZarrPlugin:
 
         QApplication.setOverrideCursor(Qt.WaitCursor)
         self._iface.messageBar().pushMessage(
-            "GeoZarr", "Fetching zarr.json...", Qgis.Info, 0
+            "GeoZarr", "Fetching metadata...", Qgis.Info, 0
         )
 
         self._fetch_thread = _FetchThread(url)
@@ -145,8 +145,8 @@ class GeoZarrPlugin:
             QMessageBox.warning(
                 self._iface.mainWindow(),
                 "GeoZarr",
-                f"Could not read zarr.json from:\n{url}\n\n"
-                "Check that the URL points to a Zarr v3 store root.",
+                f"Could not read metadata from:\n{url}\n\n"
+                "Check that the URL points to a Zarr store root.",
             )
             return
 
@@ -154,7 +154,7 @@ class GeoZarrPlugin:
             QMessageBox.warning(
                 self._iface.mainWindow(),
                 "GeoZarr",
-                "No resolutions/bands found in zarr.json.\n\n"
+                "No resolutions/bands found in metadata.\n\n"
                 "Expected resolution groups (r10m, r20m) with band arrays.",
             )
             return

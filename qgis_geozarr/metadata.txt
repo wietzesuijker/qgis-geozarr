@@ -2,8 +2,8 @@
 name=GeoZarr
 qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
-description=GeoZarr-aware loading for QGIS STAC browser: band selection, multiscales, GDAL tuning
-version=0.1.0
+description=GeoZarr-aware loading for QGIS STAC browser: band selection, multiscales, GDAL tuning (Zarr v2 + v3)
+version=0.2.0
 author=Wietze Suijker
 email=
 icon=icon.svg
@@ -15,9 +15,13 @@ repository=https://github.com/wietzesuijker/qgis-geozarr
 tags=geozarr,zarr,stac,sentinel-2,cloud-native,raster
 category=Raster
 hasProcessingProvider=no
-about=Enhances the QGIS native STAC browser with GeoZarr (Zarr v3) features: band/resolution selection, satellite band presets (Sentinel-2, Landsat), multiscales convention support, and optimized GDAL configuration for cloud access. Requires GDAL 3.13+.
+about=Enhances the QGIS native STAC browser with GeoZarr features: band/resolution selection, satellite band presets (Sentinel-2, Landsat), multiscales convention support, and optimized GDAL configuration for cloud access. Supports Zarr v2 (.zmetadata) and v3 (zarr.json). Requires GDAL 3.13+.
 
 changelog=
+    0.2.0 - Zarr v2 support
+    - Parse .zmetadata (v2 consolidated) with zarr.json (v3) fallback
+    - Extract CRS from EOPF other_metadata.horizontal_CRS_code
+    - Works with EOPF Sentinel-2 L2A production data
     0.1.0 - Initial release
     - STAC browser integration: right-click Zarr assets to load
     - Band/resolution picker with satellite presets (Sentinel-2, Landsat 8/9, MODIS, Sentinel-3)

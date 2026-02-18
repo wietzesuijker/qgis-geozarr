@@ -1,7 +1,8 @@
-"""GeoZarr convention parsing from zarr.json.
+"""GeoZarr convention parsing from zarr.json (v3) and .zmetadata (v2).
 
-Reads a single zarr.json to discover resolutions, bands, CRS, and transform.
-Zarr v3 user attributes live under root["attributes"], not at root level.
+Reads a single metadata file to discover resolutions, bands, CRS, and transform.
+Zarr v3: user attributes under root["attributes"], consolidated_metadata.
+Zarr v2: .zmetadata with paths like "measurements/reflectance/r10m/b02/.zarray".
 """
 
 from __future__ import annotations
@@ -41,35 +42,52 @@ _cache: Dict[str, ZarrRootInfo] = {}
 _lock = threading.Lock()
 
 
+def _vsi_read(url: str) -> Optional[bytes]:
+    """Read a remote file via GDAL's /vsicurl/. Returns None on failure."""
+    vsi_path = f"/vsicurl/{url}"
+    fp = gdal.VSIFOpenL(vsi_path, "rb")
+    if fp is None:
+        return None
+    data = b""
+    while True:
+        chunk = gdal.VSIFReadL(1, 65536, fp)
+        if not chunk:
+            break
+        data += chunk
+    gdal.VSIFCloseL(fp)
+    return data if data else None
+
+
 def fetch(zarr_url: str) -> Optional[ZarrRootInfo]:
-    """Fetch and cache zarr.json metadata. Returns None on failure."""
+    """Fetch and cache metadata (v3 zarr.json or v2 .zmetadata)."""
     url = zarr_url.rstrip("/")
 
     with _lock:
         if url in _cache:
             return _cache[url]
 
+    info = None
+
+    # Try Zarr v3 first
     try:
-        vsi_path = f"/vsicurl/{url}/zarr.json"
-        fp = gdal.VSIFOpenL(vsi_path, "rb")
-        if fp is None:
-            log.debug("Could not open %s", vsi_path)
-            return None
+        data = _vsi_read(f"{url}/zarr.json")
+        if data:
+            info = _parse(json.loads(data))
+    except Exception:
+        log.debug("v3 zarr.json parse failed for %s", url, exc_info=True)
 
-        data = b""
-        while True:
-            chunk = gdal.VSIFReadL(1, 65536, fp)
-            if not chunk:
-                break
-            data += chunk
-        gdal.VSIFCloseL(fp)
+    # Fall back to Zarr v2
+    if info is None:
+        try:
+            data = _vsi_read(f"{url}/.zmetadata")
+            if data:
+                info = _parse_v2(json.loads(data))
+        except Exception:
+            log.debug("v2 .zmetadata parse failed for %s", url, exc_info=True)
 
-        root = json.loads(data)
-    except Exception as exc:
-        log.debug("Failed to fetch zarr root: %s", exc)
+    if info is None:
+        log.debug("No zarr.json or .zmetadata found at %s", url)
         return None
-
-    info = _parse(root)
 
     with _lock:
         _cache[url] = info
@@ -82,14 +100,23 @@ def clear_cache() -> None:
 
 
 def fetch_resolved(zarr_url: str) -> Tuple[Optional[ZarrRootInfo], str]:
-    """Fetch zarr.json and resolve sub-groups. Returns (info, final_url)."""
+    """Fetch metadata and resolve sub-groups. Returns (info, final_url).
+
+    When bands live under a sub-group (e.g. measurements/reflectance),
+    the returned URL includes the sub-group prefix so _band_uri()
+    constructs correct paths like {url}/r10m/b02.
+    """
     info = fetch(zarr_url)
     url = zarr_url.rstrip("/")
-    if info and info.sub_group and not info.epsg:
+    if info and info.sub_group:
         sub_url = f"{url}/{info.sub_group}"
+        # v3: each group has its own zarr.json
         sub_info = fetch(sub_url)
         if sub_info and sub_info.resolutions:
             return sub_info, sub_url
+        # v2: sub-group has no separate metadata, use root info with sub URL
+        if info.resolutions:
+            return info, sub_url
     return info, url
 
 
@@ -173,6 +200,52 @@ def _parse(root: Dict[str, Any]) -> ZarrRootInfo:
     )
 
 
+def _parse_v2(zmetadata: Dict[str, Any]) -> ZarrRootInfo:
+    """Parse Zarr v2 .zmetadata into ZarrRootInfo.
+
+    Transforms v2 consolidated paths (ending in /.zarray, /.zattrs, /.zgroup)
+    into the same structure _parse_consolidated() expects.
+    """
+    meta = zmetadata.get("metadata", {})
+
+    # Root attributes for CRS
+    root_attrs = meta.get(".zattrs", {})
+    if not isinstance(root_attrs, dict):
+        root_attrs = {}
+    epsg = _parse_crs(root_attrs)
+
+    # Build array-path -> metadata dict from /.zarray entries
+    consol: Dict[str, Any] = {}
+    for path, value in meta.items():
+        if not path.endswith("/.zarray"):
+            continue
+        array_path = path[: -len("/.zarray")]
+        shape = value.get("shape") if isinstance(value, dict) else None
+        consol[array_path] = {"node_type": "array", "shape": shape}
+
+    shape_per_res: Dict[str, Tuple[int, int]] = {}
+    bands_per_res, sub_group, shape_per_res = _parse_consolidated(
+        consol, shape_per_res,
+    )
+
+    def _sort_key(name: str) -> int:
+        m = re.search(r"(\d+)", name)
+        return int(m.group(1)) if m else 0
+
+    resolutions = sorted(bands_per_res.keys(), key=_sort_key)
+
+    return ZarrRootInfo(
+        resolutions=tuple(resolutions),
+        bands_per_resolution={
+            k: tuple(sorted(v)) for k, v in bands_per_res.items()
+        },
+        shape_per_resolution=shape_per_res,
+        epsg=epsg,
+        conventions=(),
+        sub_group=sub_group,
+    )
+
+
 _RES_RE = re.compile(r"r\d+m$")
 
 
@@ -247,7 +320,7 @@ def _parse_conventions(src: Dict[str, Any]) -> List[str]:
 
 
 def _parse_crs(src: Dict[str, Any]) -> Optional[int]:
-    """Extract EPSG code from proj:code or proj:projjson."""
+    """Extract EPSG code from proj:code, proj:projjson, or v2 other_metadata."""
     code = src.get("proj:code")
     if isinstance(code, str) and code.upper().startswith("EPSG:"):
         try:
@@ -263,6 +336,17 @@ def _parse_crs(src: Dict[str, Any]) -> Optional[int]:
                 return int(pid["code"])
             except (KeyError, ValueError):
                 pass
+
+    # Zarr v2 EOPF: other_metadata.horizontal_CRS_code = "EPSG:XXXXX"
+    om = src.get("other_metadata")
+    if isinstance(om, dict):
+        hcrs = om.get("horizontal_CRS_code", "")
+        if isinstance(hcrs, str) and hcrs.upper().startswith("EPSG:"):
+            try:
+                return int(hcrs.split(":", 1)[1])
+            except (ValueError, IndexError):
+                pass
+
     return None
 
 

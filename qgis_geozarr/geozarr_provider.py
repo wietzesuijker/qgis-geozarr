@@ -287,7 +287,7 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
             "collection_id": self._extract_collection_id(item),
         }
 
-        self._msg("Fetching zarr.json...")
+        self._msg("Fetching metadata...")
         QApplication.setOverrideCursor(Qt.WaitCursor)
 
         self._fetch_thread = _ProviderFetchThread(zarr_url, stac_api_url)
@@ -314,8 +314,8 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
                 QMessageBox.warning(
                     None,
                     TAG,
-                    f"Could not read zarr.json from:\n{zarr_url}\n\n"
-                    "Check that the URL points to a Zarr v3 store root "
+                    f"Could not read metadata from:\n{zarr_url}\n\n"
+                    "Check that the URL points to a Zarr store root "
                     "(.zarr directory).",
                 )
             return
@@ -324,7 +324,7 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
             QMessageBox.warning(
                 None,
                 TAG,
-                "No bands found in zarr.json.\n\n"
+                "No bands found in metadata.\n\n"
                 "Expected resolution groups (r10m, r20m) containing "
                 "band arrays. The dataset may not follow GeoZarr conventions.",
             )
