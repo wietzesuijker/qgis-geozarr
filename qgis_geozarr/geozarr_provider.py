@@ -20,23 +20,31 @@ from qgis.core import (
     QgsStacConnection,
 )
 from qgis.gui import QgsDataItemGuiProvider
-from qgis.PyQt.QtWidgets import QAction, QMessageBox
+from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtWidgets import QAction, QApplication, QMessageBox
 
 from . import geozarr_metadata
 from .geozarr_dialog import GeoZarrLoadDialog
 
 TAG = "GeoZarr"
 
+# Track temp VRT files for cleanup
+_temp_files: set = set()
+
+
+def cleanup_temp_files() -> None:
+    """Remove all tracked temp VRT files."""
+    for path in list(_temp_files):
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+        except OSError:
+            pass
+    _temp_files.clear()
+
 
 def _find_zarr_root(url: str) -> str:
-    """Find the Zarr store root from a deep asset URL.
-
-    EOPF hrefs point deep into the store:
-        https://.../S2A_...zarr/quality/atmosphere/r10m/aot
-        https://.../S2A_...zarr/measurements/reflectance
-    We truncate at the .zarr segment to get the store root.
-    """
-    # Find .zarr in path and truncate there
+    """Find the Zarr store root from a deep asset URL."""
     m = re.search(r"(https?://[^?#]*\.zarr)", url)
     if m:
         return m.group(1)
@@ -46,33 +54,33 @@ def _find_zarr_root(url: str) -> str:
 class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
     """Injects 'Load GeoZarr...' context menu on STAC Zarr assets."""
 
+    def __init__(self, iface=None):
+        super().__init__()
+        self._iface = iface
+
     def name(self) -> str:
         return "GeoZarr"
 
-    def populateContextMenu(
-        self,
-        item: QgsDataItem,
-        menu,
-        selectedItems,
-        context,
-    ):
+    def populateContextMenu(self, item, menu, selectedItems, context):
         zarr_url = self._detect_zarr(item)
         if not zarr_url:
             return
-
         action = QAction("Load GeoZarr...", menu)
         action.triggered.connect(lambda: self._load_geozarr(item, zarr_url))
         menu.addAction(action)
 
-    def _detect_zarr(self, item: QgsDataItem) -> str:
-        """Detect if item is Zarr and return store root URL.
+    def _msg(self, text: str, level=Qgis.Info, duration: int = 0) -> None:
+        """Push a message to the QGIS message bar if iface available."""
+        if self._iface:
+            self._iface.messageBar().pushMessage(TAG, text, level, duration)
 
-        Four detection strategies (in order):
-        1. mimeUris with ZARR: prefix (QGIS-recognized Zarr assets)
-        2. mimeUris with .zarr in href
-        3. Item path/name containing .zarr
-        4. STAC item - resolve Zarr URL on click via STAC API
-        """
+    def _msg_clear(self) -> None:
+        """Clear the message bar."""
+        if self._iface:
+            self._iface.messageBar().clearWidgets()
+
+    def _detect_zarr(self, item: QgsDataItem) -> str:
+        """Detect if item is Zarr and return store root URL."""
         try:
             for uri in item.mimeUris():
                 raw = uri.uri or ""
@@ -102,7 +110,6 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
         return ""
 
     def _zarr_root_from_gdal_uri(self, gdal_uri: str) -> str:
-        """Extract store root from ZARR:"/vsicurl/https://.../.zarr/..." """
         raw = gdal_uri
         if raw.upper().startswith("ZARR:"):
             raw = raw[5:]
@@ -113,7 +120,6 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
         return _find_zarr_root(raw)
 
     def _zarr_from_parent(self, item: QgsDataItem) -> str:
-        """Walk up the tree looking for a parent with Zarr URIs."""
         parent = item.parent()
         while parent:
             try:
@@ -134,7 +140,6 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
         return ""
 
     def _extract_collection_id(self, item: QgsDataItem) -> str:
-        """Try to extract STAC collection ID from item hierarchy."""
         parent = item.parent()
         while parent:
             name = parent.name() if hasattr(parent, "name") else ""
@@ -145,13 +150,7 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
         return ""
 
     def _resolve_stac_zarr_url(self, item: QgsDataItem) -> str:
-        """Resolve Zarr store URL from a STAC item via the STAC API.
-
-        Extracts connection/collection/item IDs from the browser path
-        (not display names, which may differ from API IDs).
-        """
-        # Parse IDs from browser path - more reliable than display names.
-        # Path format: stac:/.../collections/<id>/items/<id>
+        """Resolve Zarr store URL from a STAC item via the STAC API."""
         path = item.path() or ""
         item_id, collection_id, conn_name = "", "", ""
 
@@ -162,14 +161,12 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
             elif part == "collections" and i + 1 < len(parts):
                 collection_id = parts[i + 1]
 
-        # Fall back to display names if path parsing fails
         if not item_id:
             item_id = item.name()
         if not collection_id:
             p = item.parent()
             collection_id = p.name() if p else ""
 
-        # Connection name from tree (display name = connection name in settings)
         parent = item.parent()
         while parent:
             gp = parent.parent()
@@ -182,7 +179,8 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
             QgsMessageLog.logMessage(
                 f"STAC resolve failed: item={item_id} coll={collection_id} "
                 f"conn={conn_name} path={path}",
-                TAG, Qgis.Warning,
+                TAG,
+                Qgis.Warning,
             )
             return ""
 
@@ -202,7 +200,6 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
         return url
 
     def _fetch_zarr_href(self, stac_item_url: str) -> tuple:
-        """Fetch a STAC item JSON and return (zarr_root_url, asset_key)."""
         try:
             vsi_path = f"/vsicurl/{stac_item_url}"
             fp = gdal.VSIFOpenL(vsi_path, "rb")
@@ -231,7 +228,6 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
         return ("", "")
 
     def _stac_item_name(self, item: QgsDataItem) -> str:
-        """Extract STAC item ID from browser path or display name."""
         path = item.path() or ""
         parts = path.split("/")
         for i, part in enumerate(parts):
@@ -243,40 +239,54 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
         """Fetch metadata, show dialog, create layer."""
         item_name = ""
 
-        # Resolve STAC sentinel value to actual URL
-        if zarr_url.startswith("STAC:"):
-            item_name = self._stac_item_name(item)
-            zarr_url = self._resolve_stac_zarr_url(item)
-            if not zarr_url:
-                QMessageBox.warning(
-                    None, "GeoZarr",
-                    "No Zarr assets found in this STAC item.",
-                )
-                return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            # Resolve STAC sentinel value to actual URL
+            if zarr_url.startswith("STAC:"):
+                self._msg("Resolving STAC item...")
+                item_name = self._stac_item_name(item)
+                zarr_url = self._resolve_stac_zarr_url(item)
+                if not zarr_url:
+                    QApplication.restoreOverrideCursor()
+                    QMessageBox.warning(
+                        None,
+                        TAG,
+                        "No Zarr assets found in this STAC item.\n\n"
+                        "The item may use a different format (COG, NetCDF).",
+                    )
+                    return
 
-        info = geozarr_metadata.fetch(zarr_url)
+            self._msg("Fetching zarr.json...")
+            info = geozarr_metadata.fetch(zarr_url)
 
-        # If parser found bands under a sub-group, re-fetch from there
-        # for full CRS/multiscales metadata
-        if info and info.sub_group and not info.epsg:
-            sub_url = f"{zarr_url}/{info.sub_group}"
-            sub_info = geozarr_metadata.fetch(sub_url)
-            if sub_info and sub_info.resolutions:
-                zarr_url = sub_url
-                info = sub_info
+            # If parser found bands under a sub-group, re-fetch
+            if info and info.sub_group and not info.epsg:
+                sub_url = f"{zarr_url}/{info.sub_group}"
+                sub_info = geozarr_metadata.fetch(sub_url)
+                if sub_info and sub_info.resolutions:
+                    zarr_url = sub_url
+                    info = sub_info
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._msg_clear()
 
         if info is None:
             QMessageBox.warning(
-                None, "GeoZarr",
-                f"Could not read zarr.json from:\n{zarr_url}",
+                None,
+                TAG,
+                f"Could not read zarr.json from:\n{zarr_url}\n\n"
+                "Check that the URL points to a Zarr v3 store root "
+                "(.zarr directory).",
             )
             return
 
         if not info.resolutions or not any(info.bands_per_resolution.values()):
             QMessageBox.warning(
-                None, "GeoZarr",
-                "No bands found in zarr.json. The dataset may not follow "
-                "GeoZarr conventions.",
+                None,
+                TAG,
+                "No bands found in zarr.json.\n\n"
+                "Expected resolution groups (r10m, r20m) containing "
+                "band arrays. The dataset may not follow GeoZarr conventions.",
             )
             return
 
@@ -297,48 +307,42 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
         layer_name = dlg.layer_name()
 
         if not bands:
-            QMessageBox.warning(None, "GeoZarr", "No bands selected.")
+            QMessageBox.warning(None, TAG, "No bands selected.")
             return
 
-        _create_layer(zarr_url, bands, resolution, layer_name, info)
+        self._msg("Building VRT and loading...")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            _create_layer(zarr_url, bands, resolution, layer_name, info)
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._msg_clear()
 
 
 def _vsi_prefix(url: str) -> str:
-    """Return VSI prefix for URL scheme."""
     if url.startswith("s3://"):
         return "/vsis3/"
     return "/vsicurl/"
 
 
 def _band_uri(zarr_url: str, resolution: str, band: str) -> str:
-    """Build ZARR: GDAL URI for a single band array."""
     path = f"{zarr_url}/{resolution}/{band}" if resolution else f"{zarr_url}/{band}"
     prefix = _vsi_prefix(path)
     if prefix == "/vsis3/":
-        path = path[5:]  # strip s3://
+        path = path[5:]
     return f'ZARR:"{prefix}{path}"'
 
 
 def _res_pixel_size(name: str) -> int:
-    """Extract numeric pixel size from resolution name (r10m -> 10)."""
     m = re.search(r"(\d+)", name)
     return int(m.group(1)) if m else 0
 
 
-def _overview_resolutions(
-    base_res: str,
-    bands: list,
-    info,
-) -> list:
-    """Find coarser resolutions where all requested bands exist.
-
-    Returns [(res_name, [bands_at_this_level]), ...] coarsest last.
-    Only includes levels coarser than base_res.
-    """
+def _overview_resolutions(base_res, bands, info) -> list:
+    """Find coarser resolutions where all requested bands exist."""
     base_size = _res_pixel_size(base_res)
     if not base_size:
         return []
-
     result = []
     for res in info.resolutions:
         if res == base_res:
@@ -349,24 +353,26 @@ def _overview_resolutions(
         matched = [b for b in bands if b.upper() in available]
         if matched:
             result.append((res, matched))
-
     result.sort(key=lambda x: _res_pixel_size(x[0]))
     return result
 
 
-def _build_overview_vrt(
-    zarr_url: str,
-    bands: list,
-    resolution: str,
-    info,
-) -> str:
+def _track_temp(path: str) -> str:
+    """Register a temp file for cleanup and return the path."""
+    _temp_files.add(path)
+    return path
+
+
+def _build_overview_vrt(zarr_url, bands, resolution, info) -> str:
     """Build a VRT for one overview level. Returns temp file path."""
     band_uris = [_band_uri(zarr_url, resolution, b) for b in bands]
 
     vrt_file = tempfile.NamedTemporaryFile(
-        suffix=".vrt", prefix=f"geozarr_ovr_{resolution}_", delete=False,
+        suffix=".vrt",
+        prefix=f"geozarr_ovr_{resolution}_",
+        delete=False,
     )
-    vrt_path = vrt_file.name
+    vrt_path = _track_temp(vrt_file.name)
     vrt_file.close()
 
     vrt_opts = gdal.BuildVRTOptions(separate=True)
@@ -374,20 +380,21 @@ def _build_overview_vrt(
     if vrt_ds is None:
         return ""
 
-    # Set geotransform from multiscales metadata
     gt = info.transform_per_resolution.get(resolution)
     if gt:
         vrt_ds.SetGeoTransform(gt)
     elif info.geotransform and info.shape_per_resolution.get(resolution):
-        # Derive from base geotransform + shape ratio
         base_gt = info.geotransform
         ovr_shape = info.shape_per_resolution[resolution]
-        base_shape = max(info.shape_per_resolution.values(), key=lambda s: s[0] * s[1])
+        base_shape = max(
+            info.shape_per_resolution.values(), key=lambda s: s[0] * s[1]
+        )
         if base_shape[0] > 0 and base_shape[1] > 0:
             sx = (base_gt[1] * base_shape[1]) / ovr_shape[1]
             sy = (base_gt[5] * base_shape[0]) / ovr_shape[0]
-            vrt_ds.SetGeoTransform((base_gt[0], sx, base_gt[2],
-                                    base_gt[3], base_gt[4], sy))
+            vrt_ds.SetGeoTransform(
+                (base_gt[0], sx, base_gt[2], base_gt[3], base_gt[4], sy)
+            )
 
     if info.epsg:
         srs = osr.SpatialReference()
@@ -399,17 +406,8 @@ def _build_overview_vrt(
     return vrt_path
 
 
-def _inject_overviews(
-    base_vrt_path: str,
-    ovr_vrt_paths: list,
-    bands: list,
-    ovr_bands: list,
-) -> None:
-    """Insert <Overview> elements into base VRT XML.
-
-    ovr_bands[i] = list of band names available at overview level i.
-    Band index in overview VRT matches position in that list.
-    """
+def _inject_overviews(base_vrt_path, ovr_vrt_paths, bands, ovr_bands) -> None:
+    """Insert <Overview> elements into base VRT XML."""
     tree = ET.parse(base_vrt_path)
     root = tree.getroot()
 
@@ -422,9 +420,10 @@ def _inject_overviews(
         for ovr_path, ovr_band_list in zip(ovr_vrt_paths, ovr_bands):
             if not ovr_path:
                 continue
-            # Find this band's index in the overview VRT
             try:
-                ovr_idx = [b.upper() for b in ovr_band_list].index(band_name.upper())
+                ovr_idx = [b.upper() for b in ovr_band_list].index(
+                    band_name.upper()
+                )
             except ValueError:
                 continue
             ovr = ET.SubElement(band_elem, "Overview")
@@ -437,25 +436,15 @@ def _inject_overviews(
     tree.write(base_vrt_path, xml_declaration=True, encoding="utf-8")
 
 
-def _create_layer(
-    zarr_url: str,
-    bands: list,
-    resolution: str,
-    layer_name: str,
-    info,
-) -> None:
-    """Create a QgsRasterLayer from selected bands.
-
-    Single band: direct ZARR: URI.
-    Multiple bands: VRT composite (RGB).
-    CRS/geotransform injected from zarr.json metadata.
-    """
+def _create_layer(zarr_url, bands, resolution, layer_name, info) -> None:
+    """Create a QgsRasterLayer from selected bands."""
     if len(bands) == 1 and not _overview_resolutions(resolution, bands, info):
         uri = _band_uri(zarr_url, resolution, bands[0])
         layer = QgsRasterLayer(uri, layer_name, "gdal")
         if not layer.isValid():
             QMessageBox.warning(
-                None, "GeoZarr",
+                None,
+                TAG,
                 f"Failed to load layer:\n{layer.error().message()}",
             )
             return
@@ -464,13 +453,15 @@ def _create_layer(
         QgsProject.instance().addMapLayer(layer)
         return
 
-    # Multi-band: build VRT composite
+    # Multi-band or single-band with overviews: build VRT
     band_uris = [_band_uri(zarr_url, resolution, b) for b in bands]
 
     vrt_file = tempfile.NamedTemporaryFile(
-        suffix=".vrt", prefix="geozarr_", delete=False,
+        suffix=".vrt",
+        prefix="geozarr_",
+        delete=False,
     )
-    vrt_path = vrt_file.name
+    vrt_path = _track_temp(vrt_file.name)
     vrt_file.close()
 
     vrt_opts = gdal.BuildVRTOptions(separate=True)
@@ -478,31 +469,32 @@ def _create_layer(
 
     if vrt_ds is None:
         QMessageBox.warning(
-            None, "GeoZarr",
+            None,
+            TAG,
             f"Failed to build VRT:\n{gdal.GetLastErrorMsg()}",
         )
         return
 
-    # Inject CRS from zarr.json
     if info.epsg:
         srs = osr.SpatialReference()
         srs.ImportFromEPSG(info.epsg)
         vrt_ds.SetProjection(srs.ExportToWkt())
 
-    # Inject geotransform from zarr.json
     if info.geotransform:
         vrt_ds.SetGeoTransform(info.geotransform)
 
     vrt_ds.FlushCache()
     vrt_ds = None
 
-    # Add multiscale overviews from coarser Zarr resolution levels
+    # Add multiscale overviews
     ovr_levels = _overview_resolutions(resolution, bands, info)
     if ovr_levels:
         ovr_paths = []
         ovr_band_lists = []
         for ovr_res, ovr_bands_at_level in ovr_levels:
-            ovr_path = _build_overview_vrt(zarr_url, ovr_bands_at_level, ovr_res, info)
+            ovr_path = _build_overview_vrt(
+                zarr_url, ovr_bands_at_level, ovr_res, info
+            )
             ovr_paths.append(ovr_path)
             ovr_band_lists.append(ovr_bands_at_level)
         _inject_overviews(vrt_path, ovr_paths, bands, ovr_band_lists)
@@ -510,12 +502,15 @@ def _create_layer(
     layer = QgsRasterLayer(vrt_path, layer_name, "gdal")
     if not layer.isValid():
         QMessageBox.warning(
-            None, "GeoZarr",
+            None,
+            TAG,
             f"Failed to load VRT:\n{layer.error().message()}",
         )
         return
 
     QgsProject.instance().addMapLayer(layer)
     QgsMessageLog.logMessage(
-        f"Loaded GeoZarr: {layer_name} ({len(bands)} bands)", TAG, Qgis.Info,
+        f"Loaded: {layer_name} ({len(bands)} bands, {resolution})",
+        TAG,
+        Qgis.Info,
     )

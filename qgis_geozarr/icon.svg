@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Zarr-style 3x3 grid with earth/geo colors -->
+  <rect x="2" y="2" width="18" height="18" rx="2" fill="#2d8659"/>
+  <rect x="23" y="2" width="18" height="18" rx="2" fill="#3ba272"/>
+  <rect x="44" y="2" width="18" height="18" rx="2" fill="#52b788"/>
+  <rect x="2" y="23" width="18" height="18" rx="2" fill="#3ba272"/>
+  <rect x="23" y="23" width="18" height="18" rx="2" fill="#40916c"/>
+  <rect x="44" y="23" width="18" height="18" rx="2" fill="#3ba272"/>
+  <rect x="2" y="44" width="18" height="18" rx="2" fill="#52b788"/>
+  <rect x="23" y="44" width="18" height="18" rx="2" fill="#3ba272"/>
+  <rect x="44" y="44" width="18" height="18" rx="2" fill="#2d8659"/>
+</svg>

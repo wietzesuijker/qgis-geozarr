@@ -4,16 +4,33 @@ from __future__ import annotations
 
 import logging
 
+from qgis.core import Qgis, QgsSettings
 from qgis.gui import QgisInterface, QgsGui
-from qgis.PyQt.QtWidgets import QAction, QInputDialog, QMessageBox
+from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtWidgets import (
+    QAction,
+    QApplication,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+)
+
+import os
 
 from . import gdal_config, geozarr_metadata
-from .geozarr_provider import GeoZarrDataItemGuiProvider
+from .geozarr_provider import GeoZarrDataItemGuiProvider, cleanup_temp_files
 
 log = logging.getLogger(__name__)
 
 # Minimum GDAL version for Zarr v3 sharding
 _MIN_GDAL = (3, 13)
+_SETTINGS_KEY = "GeoZarr/recent_urls"
+_MAX_RECENT = 10
 
 
 class GeoZarrPlugin:
@@ -24,81 +41,93 @@ class GeoZarrPlugin:
         self._action = None
 
     def initGui(self) -> None:
-        # Check GDAL version
         from osgeo import gdal
+
         ver = gdal.VersionInfo("VERSION_NUM")
         major = int(ver) // 1000000
         minor = (int(ver) // 10000) % 100
         if (major, minor) < _MIN_GDAL:
             log.warning(
                 "GeoZarr: GDAL %d.%d detected, %d.%d+ required for Zarr v3 sharding",
-                major, minor, *_MIN_GDAL,
+                major,
+                minor,
+                *_MIN_GDAL,
             )
 
-        # Apply cloud-optimized GDAL config
         gdal_config.apply()
 
-        # Register browser context menu provider
-        self._provider = GeoZarrDataItemGuiProvider()
+        # Register browser context menu provider with iface for message bar
+        self._provider = GeoZarrDataItemGuiProvider(iface=self._iface)
         QgsGui.dataItemGuiProviderRegistry().addProvider(self._provider)
 
         # Toolbar with standalone URL entry
         self._toolbar = self._iface.addToolBar("GeoZarr")
         self._toolbar.setObjectName("GeoZarrToolbar")
 
-        self._action = QAction("Load GeoZarr URL...", self._toolbar)
-        self._action.setToolTip("Load a GeoZarr dataset from a URL")
+        from qgis.PyQt.QtGui import QIcon
+
+        icon_path = os.path.join(os.path.dirname(__file__), "icon.svg")
+        self._action = QAction(
+            QIcon(icon_path), "Load GeoZarr URL...", self._toolbar
+        )
+        self._action.setToolTip(
+            "Load a GeoZarr dataset from a Zarr v3 URL"
+        )
         self._action.triggered.connect(self._load_from_url)
         self._toolbar.addAction(self._action)
         self._iface.addPluginToRasterMenu("GeoZarr", self._action)
 
     def unload(self) -> None:
-        # Remove browser provider
         if self._provider:
             QgsGui.dataItemGuiProviderRegistry().removeProvider(self._provider)
             self._provider = None
 
-        # Remove toolbar/menu
         if self._action:
             self._iface.removePluginRasterMenu("GeoZarr", self._action)
         if self._toolbar:
             del self._toolbar
             self._toolbar = None
 
-        # Restore GDAL config
         gdal_config.restore()
-
-        # Clear metadata cache
         geozarr_metadata.clear_cache()
+        cleanup_temp_files()
 
     def _load_from_url(self) -> None:
         """Standalone entry: paste a Zarr URL to load."""
-        url, ok = QInputDialog.getText(
-            self._iface.mainWindow(),
-            "Load GeoZarr",
-            "Zarr v3 dataset URL:",
-        )
-        if not ok or not url.strip():
+        dlg = _UrlDialog(self._iface.mainWindow())
+        if dlg.exec_() != QDialog.Accepted:
             return
 
-        url = url.strip()
+        url = dlg.url().strip()
+        if not url:
+            return
 
-        info = geozarr_metadata.fetch(url)
+        # Save to recent
+        _save_recent_url(url)
 
-        # If parser found bands under a sub-group, re-fetch from there
-        # for full CRS/multiscales metadata
-        if info and info.sub_group and not info.epsg:
-            sub_url = f"{url}/{info.sub_group}"
-            sub_info = geozarr_metadata.fetch(sub_url)
-            if sub_info and sub_info.resolutions:
-                url = sub_url
-                info = sub_info
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self._iface.messageBar().pushMessage(
+            "GeoZarr", "Fetching zarr.json...", Qgis.Info, 0
+        )
+        try:
+            info = geozarr_metadata.fetch(url)
+
+            if info and info.sub_group and not info.epsg:
+                sub_url = f"{url}/{info.sub_group}"
+                sub_info = geozarr_metadata.fetch(sub_url)
+                if sub_info and sub_info.resolutions:
+                    url = sub_url
+                    info = sub_info
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._iface.messageBar().clearWidgets()
 
         if info is None:
             QMessageBox.warning(
                 self._iface.mainWindow(),
                 "GeoZarr",
-                f"Could not read zarr.json from:\n{url}",
+                f"Could not read zarr.json from:\n{url}\n\n"
+                "Check that the URL points to a Zarr v3 store root.",
             )
             return
 
@@ -106,26 +135,125 @@ class GeoZarrPlugin:
             QMessageBox.warning(
                 self._iface.mainWindow(),
                 "GeoZarr",
-                "No resolutions/bands found in zarr.json.",
+                "No resolutions/bands found in zarr.json.\n\n"
+                "Expected resolution groups (r10m, r20m) with band arrays.",
             )
             return
 
         from .geozarr_dialog import GeoZarrLoadDialog
 
-        dlg = GeoZarrLoadDialog(
+        band_dlg = GeoZarrLoadDialog(
             info,
             parent=self._iface.mainWindow(),
             zarr_url=url,
         )
-        if dlg.exec_() != dlg.Accepted:
+        if band_dlg.exec_() != band_dlg.Accepted:
             return
 
-        bands = dlg.selected_bands()
-        resolution = dlg.selected_resolution()
-        layer_name = dlg.layer_name()
+        bands = band_dlg.selected_bands()
+        resolution = band_dlg.selected_resolution()
+        layer_name = band_dlg.layer_name()
 
         if not bands:
             return
 
-        from .geozarr_provider import _create_layer
-        _create_layer(url, bands, resolution, layer_name, info)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self._iface.messageBar().pushMessage(
+            "GeoZarr", "Building VRT and loading...", Qgis.Info, 0
+        )
+        try:
+            from .geozarr_provider import _create_layer
+
+            _create_layer(url, bands, resolution, layer_name, info)
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._iface.messageBar().clearWidgets()
+
+
+def _load_recent_urls() -> list:
+    """Load recent URLs from QgsSettings."""
+    s = QgsSettings()
+    urls = s.value(_SETTINGS_KEY, [])
+    if isinstance(urls, str):
+        return [urls] if urls else []
+    return list(urls) if urls else []
+
+
+def _save_recent_url(url: str) -> None:
+    """Add URL to front of recent list, dedup, cap at _MAX_RECENT."""
+    urls = _load_recent_urls()
+    if url in urls:
+        urls.remove(url)
+    urls.insert(0, url)
+    urls = urls[:_MAX_RECENT]
+    QgsSettings().setValue(_SETTINGS_KEY, urls)
+
+
+class _UrlDialog(QDialog):
+    """URL entry dialog with recent URLs and paste button."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Load GeoZarr URL")
+        self.setMinimumWidth(500)
+
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("Zarr v3 dataset URL:"))
+
+        url_row = QHBoxLayout()
+        self._combo = QComboBox()
+        self._combo.setEditable(True)
+        self._combo.setInsertPolicy(QComboBox.NoInsert)
+        self._combo.setSizePolicy(
+            self._combo.sizePolicy().horizontalPolicy(),
+            self._combo.sizePolicy().verticalPolicy(),
+        )
+
+        # Populate with recent URLs
+        for url in _load_recent_urls():
+            self._combo.addItem(url)
+        self._combo.setCurrentText("")
+
+        url_row.addWidget(self._combo, stretch=1)
+
+        paste_btn = QPushButton("Paste")
+        paste_btn.setToolTip("Paste URL from clipboard")
+        paste_btn.clicked.connect(self._paste)
+        url_row.addWidget(paste_btn)
+
+        layout.addLayout(url_row)
+
+        # Validation hint
+        self._hint = QLabel("")
+        self._hint.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(self._hint)
+        self._combo.editTextChanged.connect(self._validate)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        self._ok_btn = buttons.button(QDialogButtonBox.Ok)
+        self._ok_btn.setEnabled(False)
+        layout.addWidget(buttons)
+
+    def _paste(self) -> None:
+        clipboard = QApplication.clipboard()
+        text = clipboard.text().strip()
+        if text:
+            self._combo.setCurrentText(text)
+
+    def _validate(self, text: str) -> None:
+        text = text.strip()
+        if not text:
+            self._hint.setText("")
+            self._ok_btn.setEnabled(False)
+        elif "http" in text.lower() or text.startswith("s3://"):
+            self._hint.setText("")
+            self._ok_btn.setEnabled(True)
+        else:
+            self._hint.setText("URL should start with https:// or s3://")
+            self._ok_btn.setEnabled(False)
+
+    def url(self) -> str:
+        return self._combo.currentText()
