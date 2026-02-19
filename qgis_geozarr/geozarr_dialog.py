@@ -61,6 +61,18 @@ class GeoZarrLoadDialog(QDialog):
             url_edit.setToolTip("Source URL (select to copy)")
             layout.addWidget(url_edit)
 
+        # Dataset info
+        info_parts = self._build_info_lines(info)
+        if info_parts:
+            info_label = QLabel(
+                "<span style='color:#555; font-size:11px'>"
+                + " &middot; ".join(info_parts)
+                + "</span>"
+            )
+            info_label.setWordWrap(True)
+            info_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            layout.addWidget(info_label)
+
         # Resolution selector
         if len(info.resolutions) > 1:
             res_group = QGroupBox("Resolution")
@@ -120,7 +132,7 @@ class GeoZarrLoadDialog(QDialog):
         scroll.setWidgetResizable(True)
         scroll.setWidget(self._band_widget)
         scroll.setFrameShape(scroll.NoFrame)
-        scroll.setMinimumHeight(120)
+        scroll.setMinimumHeight(180)
         layout.addWidget(scroll, stretch=1)
 
         # Layer name
@@ -139,6 +151,37 @@ class GeoZarrLoadDialog(QDialog):
 
         # Populate initial bands
         self._populate_bands(self._current_resolution())
+
+    @staticmethod
+    def _build_info_lines(info: ZarrRootInfo) -> list:
+        """Build compact info strings for the dataset header."""
+        parts = []
+        if info.epsg:
+            parts.append(f"EPSG:{info.epsg}")
+        # Extent from geotransform + largest shape
+        if info.geotransform and info.shape_per_resolution:
+            gt = info.geotransform
+            shape = max(
+                info.shape_per_resolution.values(), key=lambda s: s[0] * s[1],
+            )
+            x_min = gt[0]
+            y_max = gt[3]
+            x_max = x_min + gt[1] * shape[1]
+            y_min = y_max + gt[5] * shape[0]
+            if info.epsg and info.epsg == 4326:
+                fmt = ".4f"
+            else:
+                fmt = ".0f"
+            parts.append(
+                f"{x_min:{fmt}}, {y_min:{fmt}} - {x_max:{fmt}}, {y_max:{fmt}}"
+            )
+        total_bands = sum(len(b) for b in info.bands_per_resolution.values())
+        parts.append(
+            f"{len(info.resolutions)} res, {total_bands} bands"
+        )
+        if info.conventions:
+            parts.append(", ".join(info.conventions))
+        return parts
 
     def _resolution_label(self, res: str) -> str:
         """Format resolution for display: 'r10m - 10980 x 10980 (10 m/px)'."""
@@ -169,7 +212,8 @@ class GeoZarrLoadDialog(QDialog):
 
         bands = self._info.bands_per_resolution.get(resolution, ())
         for band in bands:
-            label = band_presets.get_band_label(self._satellite, band)
+            desc = self._info.band_descriptions.get(band, "")
+            label = band_presets.get_band_label(self._satellite, band, desc)
             cb = QCheckBox(label)
             tooltip = band_presets.get_band_tooltip(self._satellite, band)
             if tooltip != band:

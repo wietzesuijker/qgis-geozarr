@@ -134,12 +134,16 @@ def preset_names(satellite: str) -> List[str]:
     return list(presets.keys()) if presets else []
 
 
-def get_band_label(satellite: Optional[str], band_id: str) -> str:
-    """Human-readable band label. Falls back to raw band_id."""
+def get_band_label(
+    satellite: Optional[str], band_id: str, description: str = "",
+) -> str:
+    """Human-readable band label. Falls back to description, then raw band_id."""
     if satellite:
         info = BAND_INFO.get(satellite.lower(), {}).get(band_id.upper())
         if info:
             return f"{band_id.upper()} - {info[0]} ({info[1]} nm)"
+    if description:
+        return f"{band_id} - {description}"
     return band_id
 
 

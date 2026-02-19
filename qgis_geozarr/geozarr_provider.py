@@ -14,11 +14,14 @@ from osgeo import gdal, osr
 
 from qgis.core import (
     Qgis,
+    QgsContrastEnhancement,
     QgsCoordinateReferenceSystem,
     QgsDataItem,
     QgsMessageLog,
+    QgsMultiBandColorRenderer,
     QgsProject,
     QgsRasterLayer,
+    QgsRasterMinMaxOrigin,
     QgsStacConnection,
 )
 from qgis.gui import QgsDataItemGuiProvider
@@ -71,8 +74,11 @@ def _fetch_zarr_href(stac_item_url: str) -> tuple:
             data += chunk
         gdal.VSIFCloseL(fp)
         stac_item = json.loads(data)
-    except Exception:
+    except (json.JSONDecodeError, OSError) as e:
         log.debug("STAC item fetch failed: %s", stac_item_url, exc_info=True)
+        QgsMessageLog.logMessage(
+            f"STAC item fetch failed for {stac_item_url}: {e}", TAG, Qgis.Warning,
+        )
         return ("", "")
 
     assets = stac_item.get("assets", {})
@@ -147,24 +153,24 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
                     return self._zarr_root_from_gdal_uri(raw)
                 if ".zarr" in raw.lower():
                     return _find_zarr_root(raw)
-        except Exception:
-            log.debug("Zarr detection via mimeUris failed", exc_info=True)
+        except Exception as e:
+            log.debug("Zarr detection via mimeUris failed: %s", e, exc_info=True)
 
         try:
             path = item.path() or ""
             name = item.name() or ""
             if ".zarr" in path.lower() or ".zarr" in name.lower():
                 return self._zarr_from_parent(item)
-        except Exception:
-            log.debug("Zarr detection via path failed", exc_info=True)
+        except Exception as e:
+            log.debug("Zarr detection via path failed: %s", e, exc_info=True)
 
         # Strategy 4: any STAC item - resolve via API when clicked
         try:
             path = item.path() or ""
             if "/items/" in path and "stac" in path.lower():
                 return f"STAC:{path}"
-        except Exception:
-            log.debug("STAC item detection failed", exc_info=True)
+        except Exception as e:
+            log.debug("STAC item detection failed: %s", e, exc_info=True)
 
         return ""
 
@@ -193,8 +199,8 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
                         if cleaned.startswith("/vsicurl/"):
                             cleaned = cleaned[9:]
                         return _find_zarr_root(cleaned)
-            except Exception:
-                log.debug("Zarr parent walk failed", exc_info=True)
+            except Exception as e:
+                log.debug("Zarr parent walk failed: %s", e, exc_info=True)
             parent = parent.parent()
         return ""
 
@@ -245,8 +251,8 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
 
         try:
             conn_data = QgsStacConnection.connection(conn_name)
-        except Exception:
-            log.debug("STAC connection lookup failed: %s", conn_name, exc_info=True)
+        except (AttributeError, RuntimeError) as e:
+            log.debug("STAC connection lookup failed: %s: %s", conn_name, e, exc_info=True)
             return ""
         if not conn_data or not conn_data.url:
             return ""
@@ -359,7 +365,10 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
     def stop_fetch(self) -> None:
         """Cancel any running fetch thread."""
         if self._fetch_thread and self._fetch_thread.isRunning():
-            self._fetch_thread.finished.disconnect()
+            try:
+                self._fetch_thread.finished.disconnect()
+            except (RuntimeError, TypeError):
+                pass
             self._fetch_thread.wait(3000)
         self._fetch_thread = None
 
@@ -555,8 +564,37 @@ def _create_layer(zarr_url, bands, resolution, layer_name, info) -> None:
         return
 
     QgsProject.instance().addMapLayer(layer)
+    _auto_style(layer, len(bands))
     QgsMessageLog.logMessage(
         f"Loaded: {layer_name} ({len(bands)} bands, {resolution})",
         TAG,
         Qgis.Info,
     )
+
+
+def _auto_style(layer: QgsRasterLayer, band_count: int) -> None:
+    """Apply RGB rendering with cumulative cut stretch for 3-band composites."""
+    if band_count != 3:
+        return
+    dp = layer.dataProvider()
+    renderer = QgsMultiBandColorRenderer(dp, 1, 2, 3)
+    origin = QgsRasterMinMaxOrigin()
+    origin.setLimits(QgsRasterMinMaxOrigin.CumulativeCut)
+    origin.setCumulativeCutLower(0.02)
+    origin.setCumulativeCutUpper(0.98)
+    origin.setStatAccuracy(QgsRasterMinMaxOrigin.Estimated)
+    renderer.setMinMaxOrigin(origin)
+
+    for band_idx, setter in (
+        (1, renderer.setRedContrastEnhancement),
+        (2, renderer.setGreenContrastEnhancement),
+        (3, renderer.setBlueContrastEnhancement),
+    ):
+        ce = QgsContrastEnhancement(dp.dataType(band_idx))
+        ce.setContrastEnhancementAlgorithm(
+            QgsContrastEnhancement.StretchToMinimumMaximum,
+        )
+        setter(ce)
+
+    layer.setRenderer(renderer)
+    layer.triggerRepaint()

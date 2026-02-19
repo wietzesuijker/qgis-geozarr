@@ -36,6 +36,7 @@ class ZarrRootInfo:
     geotransform: Optional[Tuple[float, ...]] = None  # GDAL order
     conventions: Tuple[str, ...] = ()
     sub_group: str = ""  # prefix path for bands (e.g. "measurements/reflectance")
+    band_descriptions: Dict[str, str] = field(default_factory=dict)  # band_id -> description
 
 
 _cache: Dict[str, ZarrRootInfo] = {}
@@ -73,8 +74,8 @@ def fetch(zarr_url: str) -> Optional[ZarrRootInfo]:
         data = _vsi_read(f"{url}/zarr.json")
         if data:
             info = _parse(json.loads(data))
-    except Exception:
-        log.debug("v3 zarr.json parse failed for %s", url, exc_info=True)
+    except (json.JSONDecodeError, OSError, KeyError) as e:
+        log.warning("Zarr v3 parse failed for %s: %s", url, e)
 
     # Fall back to Zarr v2
     if info is None:
@@ -82,8 +83,8 @@ def fetch(zarr_url: str) -> Optional[ZarrRootInfo]:
             data = _vsi_read(f"{url}/.zmetadata")
             if data:
                 info = _parse_v2(json.loads(data))
-        except Exception:
-            log.debug("v2 .zmetadata parse failed for %s", url, exc_info=True)
+        except (json.JSONDecodeError, OSError, KeyError) as e:
+            log.warning("Zarr v2 parse failed for %s: %s", url, e)
 
     if info is None:
         log.debug("No zarr.json or .zmetadata found at %s", url)
@@ -182,6 +183,21 @@ def _parse(root: Dict[str, Any]) -> ZarrRootInfo:
                 if bands:
                     bands_per_res[key] = bands
 
+    # Extract band descriptions from consolidated metadata attributes
+    band_descriptions: Dict[str, str] = {}
+    for path, meta in consol.items():
+        if not isinstance(meta, dict):
+            continue
+        member_attrs = meta.get("attributes", {})
+        if not isinstance(member_attrs, dict):
+            continue
+        band_id = path.rsplit("/", 1)[-1]
+        desc = member_attrs.get("long_name") or member_attrs.get(
+            "standard_name", "",
+        )
+        if desc and isinstance(desc, str):
+            band_descriptions[band_id] = desc
+
     def _sort_key(name: str) -> int:
         m = re.search(r"(\d+)", name)
         return int(m.group(1)) if m else 0
@@ -197,6 +213,7 @@ def _parse(root: Dict[str, Any]) -> ZarrRootInfo:
         geotransform=geotransform,
         conventions=tuple(conventions),
         sub_group=sub_group,
+        band_descriptions=band_descriptions,
     )
 
 
@@ -228,6 +245,17 @@ def _parse_v2(zmetadata: Dict[str, Any]) -> ZarrRootInfo:
         consol, shape_per_res,
     )
 
+    # Extract band descriptions from per-array .zattrs
+    band_descriptions: Dict[str, str] = {}
+    for path, value in meta.items():
+        if not path.endswith("/.zattrs") or not isinstance(value, dict):
+            continue
+        array_path = path[: -len("/.zattrs")]
+        band_id = array_path.rsplit("/", 1)[-1]
+        desc = value.get("long_name") or value.get("standard_name", "")
+        if desc and isinstance(desc, str):
+            band_descriptions[band_id] = desc
+
     def _sort_key(name: str) -> int:
         m = re.search(r"(\d+)", name)
         return int(m.group(1)) if m else 0
@@ -243,6 +271,7 @@ def _parse_v2(zmetadata: Dict[str, Any]) -> ZarrRootInfo:
         epsg=epsg,
         conventions=(),
         sub_group=sub_group,
+        band_descriptions=band_descriptions,
     )
 
 

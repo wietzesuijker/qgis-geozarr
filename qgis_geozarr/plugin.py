@@ -96,7 +96,10 @@ class GeoZarrPlugin:
 
     def unload(self) -> None:
         if self._fetch_thread and self._fetch_thread.isRunning():
-            self._fetch_thread.finished.disconnect()
+            try:
+                self._fetch_thread.finished.disconnect()
+            except (RuntimeError, TypeError):
+                pass
             self._fetch_thread.wait(3000)
         self._fetch_thread = None
 
