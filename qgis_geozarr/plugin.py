@@ -100,6 +100,7 @@ class GeoZarrPlugin:
                 self._fetch_thread.finished.disconnect()
             except (RuntimeError, TypeError):
                 pass
+            self._fetch_thread.quit()
             self._fetch_thread.wait(3000)
         self._fetch_thread = None
 
@@ -135,6 +136,12 @@ class GeoZarrPlugin:
             "GeoZarr", "Fetching metadata...", Qgis.Info, 0
         )
 
+        # Disconnect old thread to prevent double-click race
+        if self._fetch_thread:
+            try:
+                self._fetch_thread.finished.disconnect()
+            except (RuntimeError, TypeError):
+                pass
         self._fetch_thread = _FetchThread(url)
         self._fetch_thread.finished.connect(self._on_url_fetch_done)
         self._fetch_thread.start()

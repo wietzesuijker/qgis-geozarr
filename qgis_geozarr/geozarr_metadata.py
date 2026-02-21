@@ -24,6 +24,31 @@ _NON_BAND = frozenset({
 })
 
 
+# Zarr data_type -> GDAL VRT dataType
+_ZARR_TO_GDAL_DTYPE: Dict[str, str] = {
+    "bool": "Byte",
+    "uint8": "Byte",
+    "uint16": "UInt16",
+    "int16": "Int16",
+    "uint32": "UInt32",
+    "int32": "Int32",
+    "uint64": "UInt64",
+    "int64": "Int64",
+    "float32": "Float32",
+    "float64": "Float64",
+}
+
+# Zarr v2 numpy dtype string -> canonical name (for _ZARR_TO_GDAL_DTYPE)
+_V2_DTYPE_MAP: Dict[str, str] = {
+    "|u1": "uint8", "<u2": "uint16", ">u2": "uint16",
+    "<i2": "int16", ">i2": "int16",
+    "<u4": "uint32", ">u4": "uint32",
+    "<i4": "int32", ">i4": "int32",
+    "<f4": "float32", ">f4": "float32",
+    "<f8": "float64", ">f8": "float64",
+}
+
+
 @dataclass
 class ZarrRootInfo:
     """Parsed zarr.json: resolutions, bands, and GeoZarr conventions."""
@@ -32,11 +57,18 @@ class ZarrRootInfo:
     bands_per_resolution: Dict[str, Tuple[str, ...]]
     shape_per_resolution: Dict[str, Tuple[int, int]] = field(default_factory=dict)
     transform_per_resolution: Dict[str, Tuple[float, ...]] = field(default_factory=dict)
+    dtype_per_resolution: Dict[str, str] = field(default_factory=dict)  # GDAL dtype
     epsg: Optional[int] = None
     geotransform: Optional[Tuple[float, ...]] = None  # GDAL order
     conventions: Tuple[str, ...] = ()
     sub_group: str = ""  # prefix path for bands (e.g. "measurements/reflectance")
     band_descriptions: Dict[str, str] = field(default_factory=dict)  # band_id -> description
+
+
+def _res_sort_key(name: str) -> int:
+    """Sort resolution names by numeric value (r10m -> 10, r20m -> 20)."""
+    m = re.search(r"(\d+)", name)
+    return int(m.group(1)) if m else 0
 
 
 _cache: Dict[str, ZarrRootInfo] = {}
@@ -49,14 +81,16 @@ def _vsi_read(url: str) -> Optional[bytes]:
     fp = gdal.VSIFOpenL(vsi_path, "rb")
     if fp is None:
         return None
-    data = b""
-    while True:
-        chunk = gdal.VSIFReadL(1, 65536, fp)
-        if not chunk:
-            break
-        data += chunk
-    gdal.VSIFCloseL(fp)
-    return data if data else None
+    try:
+        buf = bytearray()
+        while True:
+            chunk = gdal.VSIFReadL(1, 65536, fp)
+            if not chunk:
+                break
+            buf.extend(chunk)
+    finally:
+        gdal.VSIFCloseL(fp)
+    return bytes(buf) if buf else None
 
 
 def fetch(zarr_url: str) -> Optional[ZarrRootInfo]:
@@ -165,10 +199,11 @@ def _parse(root: Dict[str, Any]) -> ZarrRootInfo:
     # (depth 4) are both handled. We find the sub-group with the most bands.
     consol = root.get("consolidated_metadata", {}).get("metadata", {})
     sub_group = ""
+    dtype_per_res: Dict[str, str] = {}
 
     if consol:
         bands_per_res, sub_group, shape_per_res = _parse_consolidated(
-            consol, shape_per_res,
+            consol, shape_per_res, dtype_per_res,
         )
 
     # Members fallback (inline zarr.json without consolidated_metadata)
@@ -198,17 +233,14 @@ def _parse(root: Dict[str, Any]) -> ZarrRootInfo:
         if desc and isinstance(desc, str):
             band_descriptions[band_id] = desc
 
-    def _sort_key(name: str) -> int:
-        m = re.search(r"(\d+)", name)
-        return int(m.group(1)) if m else 0
-
-    resolutions = sorted(bands_per_res.keys(), key=_sort_key)
+    resolutions = sorted(bands_per_res.keys(), key=_res_sort_key)
 
     return ZarrRootInfo(
         resolutions=tuple(resolutions),
         bands_per_resolution={k: tuple(sorted(v)) for k, v in bands_per_res.items()},
         shape_per_resolution=shape_per_res,
         transform_per_resolution=transform_per_res,
+        dtype_per_resolution=dtype_per_res,
         epsg=epsg,
         geotransform=geotransform,
         conventions=tuple(conventions),
@@ -237,12 +269,21 @@ def _parse_v2(zmetadata: Dict[str, Any]) -> ZarrRootInfo:
         if not path.endswith("/.zarray"):
             continue
         array_path = path[: -len("/.zarray")]
-        shape = value.get("shape") if isinstance(value, dict) else None
-        consol[array_path] = {"node_type": "array", "shape": shape}
+        entry: Dict[str, Any] = {"node_type": "array"}
+        if isinstance(value, dict):
+            entry["shape"] = value.get("shape")
+            # v2 dtype: numpy-style string like "<u2", "|u1", "<f4"
+            v2_dtype = value.get("dtype", "")
+            if isinstance(v2_dtype, str):
+                mapped = _V2_DTYPE_MAP.get(v2_dtype)
+                if mapped:
+                    entry["data_type"] = mapped
+        consol[array_path] = entry
 
     shape_per_res: Dict[str, Tuple[int, int]] = {}
+    dtype_per_res: Dict[str, str] = {}
     bands_per_res, sub_group, shape_per_res = _parse_consolidated(
-        consol, shape_per_res,
+        consol, shape_per_res, dtype_per_res,
     )
 
     # Extract band descriptions from per-array .zattrs
@@ -256,11 +297,7 @@ def _parse_v2(zmetadata: Dict[str, Any]) -> ZarrRootInfo:
         if desc and isinstance(desc, str):
             band_descriptions[band_id] = desc
 
-    def _sort_key(name: str) -> int:
-        m = re.search(r"(\d+)", name)
-        return int(m.group(1)) if m else 0
-
-    resolutions = sorted(bands_per_res.keys(), key=_sort_key)
+    resolutions = sorted(bands_per_res.keys(), key=_res_sort_key)
 
     return ZarrRootInfo(
         resolutions=tuple(resolutions),
@@ -268,6 +305,7 @@ def _parse_v2(zmetadata: Dict[str, Any]) -> ZarrRootInfo:
             k: tuple(sorted(v)) for k, v in bands_per_res.items()
         },
         shape_per_resolution=shape_per_res,
+        dtype_per_resolution=dtype_per_res,
         epsg=epsg,
         conventions=(),
         sub_group=sub_group,
@@ -281,6 +319,7 @@ _RES_RE = re.compile(r"r\d+m$")
 def _parse_consolidated(
     consol: Dict[str, Any],
     shape_per_res: Dict[str, Tuple[int, int]],
+    dtype_per_res: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, List[str]], str, Dict[str, Tuple[int, int]]]:
     """Parse consolidated_metadata paths at any depth.
 
@@ -291,6 +330,9 @@ def _parse_consolidated(
     measurements/reflectance vs conditions/mask/detector_footprint),
     picks the one with the most bands.
     """
+    if dtype_per_res is None:
+        dtype_per_res = {}
+
     # prefix -> {resolution -> [band_names]}
     groups: Dict[str, Dict[str, List[str]]] = {}
 
@@ -317,7 +359,18 @@ def _parse_consolidated(
         if res_seg not in shape_per_res:
             shape = meta.get("shape")
             if isinstance(shape, (list, tuple)) and len(shape) >= 2:
-                shape_per_res[res_seg] = (int(shape[-2]), int(shape[-1]))
+                try:
+                    shape_per_res[res_seg] = (int(shape[-2]), int(shape[-1]))
+                except (ValueError, TypeError):
+                    log.warning("Invalid shape %s for %s", shape, path)
+
+        # Extract data type (first band per resolution wins)
+        if res_seg not in dtype_per_res:
+            zarr_dtype = meta.get("data_type")
+            if isinstance(zarr_dtype, str):
+                gdal_dtype = _ZARR_TO_GDAL_DTYPE.get(zarr_dtype.lower())
+                if gdal_dtype:
+                    dtype_per_res[res_seg] = gdal_dtype
 
     if not groups:
         return {}, "", shape_per_res
@@ -326,6 +379,12 @@ def _parse_consolidated(
     best_prefix = max(
         groups, key=lambda p: sum(len(v) for v in groups[p].values()),
     )
+    total = sum(len(v) for v in groups[best_prefix].values())
+    if len(groups) > 1:
+        log.debug(
+            "Consolidated: %d prefixes, selected '%s' (%d bands)",
+            len(groups), best_prefix, total,
+        )
     return groups[best_prefix], best_prefix, shape_per_res
 
 

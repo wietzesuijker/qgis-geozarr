@@ -9,8 +9,14 @@ zip:
 	@rm $(PLUGIN_NAME)/LICENSE
 	@echo "Built $(PLUGIN_NAME).zip (v$(VERSION))"
 
+test:
+	python -m pytest tests/ -q
+
+lint:
+	ruff check $(PLUGIN_NAME)/ tests/
+
 clean:
 	rm -f $(PLUGIN_NAME).zip
 	find $(PLUGIN_NAME) -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
-.PHONY: zip clean
+.PHONY: zip test lint clean

@@ -1,0 +1,118 @@
+"""Shared fixtures for qgis-geozarr tests."""
+
+import pytest
+
+from qgis_geozarr.geozarr_metadata import ZarrRootInfo
+
+
+@pytest.fixture
+def sample_v3_zarr_json():
+    """Minimal Zarr v3 zarr.json resembling EOPF Sentinel-2 structure."""
+    return {
+        "zarr_format": 3,
+        "node_type": "group",
+        "attributes": {
+            "proj:code": "EPSG:32627",
+            "spatial:transform": [10.0, 0.0, 399960.0, 0.0, -10.0, 4500000.0],
+        },
+        "consolidated_metadata": {
+            "metadata": {
+                "measurements/reflectance/r10m/b02": {
+                    "node_type": "array",
+                    "shape": [10980, 10980],
+                    "data_type": "uint16",
+                },
+                "measurements/reflectance/r10m/b03": {
+                    "node_type": "array",
+                    "shape": [10980, 10980],
+                    "data_type": "uint16",
+                },
+                "measurements/reflectance/r10m/b04": {
+                    "node_type": "array",
+                    "shape": [10980, 10980],
+                    "data_type": "uint16",
+                },
+                "measurements/reflectance/r10m/b08": {
+                    "node_type": "array",
+                    "shape": [10980, 10980],
+                    "data_type": "uint16",
+                },
+                "measurements/reflectance/r20m/b05": {
+                    "node_type": "array",
+                    "shape": [5490, 5490],
+                    "data_type": "uint16",
+                },
+                "measurements/reflectance/r20m/b06": {
+                    "node_type": "array",
+                    "shape": [5490, 5490],
+                    "data_type": "uint16",
+                },
+                "measurements/reflectance/r20m/b8a": {
+                    "node_type": "array",
+                    "shape": [5490, 5490],
+                    "data_type": "uint16",
+                },
+                # Noise group with fewer bands - should NOT be selected
+                "conditions/mask/detector_footprint/r10m/b02": {
+                    "node_type": "array",
+                    "shape": [10980, 10980],
+                    "data_type": "uint8",
+                },
+            },
+        },
+    }
+
+
+@pytest.fixture
+def sample_v2_zmetadata():
+    """Minimal Zarr v2 .zmetadata resembling EOPF production."""
+    return {
+        "metadata": {
+            ".zattrs": {
+                "other_metadata": {"horizontal_CRS_code": "EPSG:32632"},
+            },
+            ".zgroup": {"zarr_format": 2},
+            "measurements/reflectance/r10m/b02/.zarray": {
+                "shape": [10980, 10980],
+                "dtype": "<u2",
+                "chunks": [1024, 1024],
+            },
+            "measurements/reflectance/r10m/b02/.zattrs": {
+                "long_name": "Blue (490 nm)",
+            },
+            "measurements/reflectance/r10m/b03/.zarray": {
+                "shape": [10980, 10980],
+                "dtype": "<u2",
+            },
+            "measurements/reflectance/r10m/b03/.zattrs": {
+                "standard_name": "green_reflectance",
+            },
+            "measurements/reflectance/r20m/b05/.zarray": {
+                "shape": [5490, 5490],
+                "dtype": "<u2",
+            },
+            "measurements/reflectance/r20m/b05/.zattrs": {},
+        },
+    }
+
+
+@pytest.fixture
+def sample_zarr_root_info():
+    """Pre-built ZarrRootInfo for provider tests."""
+    return ZarrRootInfo(
+        resolutions=("r10m", "r20m"),
+        bands_per_resolution={
+            "r10m": ("b02", "b03", "b04", "b08"),
+            "r20m": ("b05", "b06", "b8a"),
+        },
+        shape_per_resolution={
+            "r10m": (10980, 10980),
+            "r20m": (5490, 5490),
+        },
+        transform_per_resolution={},
+        dtype_per_resolution={"r10m": "UInt16", "r20m": "UInt16"},
+        epsg=32627,
+        geotransform=(399960.0, 10.0, 0.0, 4500000.0, 0.0, -10.0),
+        sub_group="measurements/reflectance",
+        band_descriptions={"b02": "Blue (490 nm)"},
+    )

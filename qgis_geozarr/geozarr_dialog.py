@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Dict, List, Optional, Tuple
 
 from qgis.PyQt.QtCore import Qt
@@ -24,6 +25,57 @@ from . import band_presets
 from .geozarr_metadata import ZarrRootInfo
 
 
+def populate_band_checkboxes(
+    info: ZarrRootInfo,
+    resolution: str,
+    band_layout: QVBoxLayout,
+    band_checks: Dict[str, QCheckBox],
+    satellite: Optional[str],
+    preset_buttons: Optional[List[QPushButton]] = None,
+    auto_select: bool = True,
+) -> None:
+    """Populate band checkboxes into a layout. Shared by load + time series dialogs."""
+    # Clear existing
+    for cb in band_checks.values():
+        band_layout.removeWidget(cb)
+        cb.deleteLater()
+    band_checks.clear()
+
+    bands = info.bands_per_resolution.get(resolution, ())
+    for b in bands:
+        desc = info.band_descriptions.get(b, "")
+        label = band_presets.get_band_label(satellite, b, desc)
+        cb = QCheckBox(label)
+        tooltip = band_presets.get_band_tooltip(satellite, b)
+        if tooltip != b:
+            cb.setToolTip(tooltip)
+        cb.setProperty("band_id", b)
+        band_checks[b] = cb
+        band_layout.addWidget(cb)
+
+    band_layout.addStretch()
+
+    # Enable/disable preset buttons
+    if preset_buttons:
+        available = {b.upper() for b in bands}
+        for btn in preset_buttons:
+            pbands = btn.property("preset_bands")
+            btn.setEnabled(all(x.upper() in available for x in pbands))
+
+    # Auto-select default preset or first 3
+    if auto_select:
+        if satellite:
+            default = band_presets.default_preset(satellite)
+            if default:
+                band_set = {x.upper() for x in default}
+                for name, cb in band_checks.items():
+                    cb.setChecked(name.upper() in band_set)
+                return
+        for i, cb in enumerate(band_checks.values()):
+            if i < 3:
+                cb.setChecked(True)
+
+
 class GeoZarrLoadDialog(QDialog):
     """Dialog for selecting bands and resolution from a GeoZarr dataset."""
 
@@ -43,6 +95,7 @@ class GeoZarrLoadDialog(QDialog):
         self._item_name = item_name
         self._band_checks: Dict[str, QCheckBox] = {}
         self._preset_buttons: List[QPushButton] = []
+        self._res_combo = None
         self._satellite = (
             band_presets.detect_satellite(collection_id) if collection_id else None
         )
@@ -50,7 +103,17 @@ class GeoZarrLoadDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(8)
 
-        # Source URL (copyable)
+        self._build_header(layout, zarr_url, info)
+        self._build_resolution_selector(layout, info)
+        self._build_preset_buttons(layout)
+        self._build_band_area(layout)
+        self._build_footer(layout, zarr_url)
+
+        # Populate initial bands
+        self._populate_bands(self._current_resolution())
+
+    def _build_header(self, layout, zarr_url, info):
+        """Source URL + dataset info summary."""
         if zarr_url:
             url_edit = QLineEdit(zarr_url)
             url_edit.setReadOnly(True)
@@ -61,7 +124,6 @@ class GeoZarrLoadDialog(QDialog):
             url_edit.setToolTip("Source URL (select to copy)")
             layout.addWidget(url_edit)
 
-        # Dataset info
         info_parts = self._build_info_lines(info)
         if info_parts:
             info_label = QLabel(
@@ -73,40 +135,44 @@ class GeoZarrLoadDialog(QDialog):
             info_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
             layout.addWidget(info_label)
 
-        # Resolution selector
-        if len(info.resolutions) > 1:
-            res_group = QGroupBox("Resolution")
-            res_layout = QHBoxLayout(res_group)
-            self._res_combo = QComboBox()
-            for res in info.resolutions:
-                label = self._resolution_label(res)
-                self._res_combo.addItem(label, res)
-            self._res_combo.currentIndexChanged.connect(self._on_resolution_changed)
-            res_layout.addWidget(self._res_combo)
-            layout.addWidget(res_group)
-        else:
-            self._res_combo = None
+    def _build_resolution_selector(self, layout, info):
+        """Resolution combo box (shown only when > 1 resolution)."""
+        if len(info.resolutions) <= 1:
+            return
+        res_group = QGroupBox("Resolution")
+        res_layout = QHBoxLayout(res_group)
+        self._res_combo = QComboBox()
+        for res in info.resolutions:
+            label = self._resolution_label(res)
+            self._res_combo.addItem(label, res)
+        self._res_combo.currentIndexChanged.connect(self._on_resolution_changed)
+        res_layout.addWidget(self._res_combo)
+        layout.addWidget(res_group)
 
-        # Preset buttons
-        if self._satellite:
-            presets = band_presets.get_presets(self._satellite)
-            if presets:
-                preset_group = QGroupBox(f"Presets ({self._satellite})")
-                preset_layout = QHBoxLayout(preset_group)
-                for name in list(presets.keys())[:4]:
-                    btn = QPushButton(name.replace("_", " ").title())
-                    tooltip = band_presets.get_preset_tooltip(self._satellite, name)
-                    if tooltip:
-                        btn.setToolTip(tooltip)
-                    btn.clicked.connect(
-                        lambda checked, n=name: self._apply_preset(n)
-                    )
-                    btn.setProperty("preset_bands", presets[name])
-                    preset_layout.addWidget(btn)
-                    self._preset_buttons.append(btn)
-                layout.addWidget(preset_group)
+    def _build_preset_buttons(self, layout):
+        """Satellite band preset buttons."""
+        if not self._satellite:
+            return
+        presets = band_presets.get_presets(self._satellite)
+        if not presets:
+            return
+        preset_group = QGroupBox(f"Presets ({self._satellite})")
+        preset_layout = QHBoxLayout(preset_group)
+        for name in list(presets.keys())[:4]:
+            btn = QPushButton(name.replace("_", " ").title())
+            tooltip = band_presets.get_preset_tooltip(self._satellite, name)
+            if tooltip:
+                btn.setToolTip(tooltip)
+            btn.clicked.connect(
+                lambda checked, n=name: self._apply_preset(n)
+            )
+            btn.setProperty("preset_bands", presets[name])
+            preset_layout.addWidget(btn)
+            self._preset_buttons.append(btn)
+        layout.addWidget(preset_group)
 
-        # Bands group with select all/clear
+    def _build_band_area(self, layout):
+        """Scrollable band checkbox area with All/None buttons."""
         bands_header = QHBoxLayout()
         bands_header.addWidget(QLabel("<b>Bands</b>"))
         bands_header.addStretch()
@@ -122,7 +188,6 @@ class GeoZarrLoadDialog(QDialog):
         bands_header.addWidget(btn_none)
         layout.addLayout(bands_header)
 
-        # Scrollable band area
         self._band_widget = QWidget()
         self._band_layout = QVBoxLayout(self._band_widget)
         self._band_layout.setContentsMargins(4, 4, 4, 4)
@@ -135,7 +200,8 @@ class GeoZarrLoadDialog(QDialog):
         scroll.setMinimumHeight(180)
         layout.addWidget(scroll, stretch=1)
 
-        # Layer name
+    def _build_footer(self, layout, zarr_url):
+        """Layer name field + OK/Cancel buttons."""
         name_layout = QHBoxLayout()
         name_layout.addWidget(QLabel("Layer name:"))
         self._name_edit = QLineEdit()
@@ -143,14 +209,10 @@ class GeoZarrLoadDialog(QDialog):
         name_layout.addWidget(self._name_edit)
         layout.addLayout(name_layout)
 
-        # OK/Cancel
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
-
-        # Populate initial bands
-        self._populate_bands(self._current_resolution())
 
     @staticmethod
     def _build_info_lines(info: ZarrRootInfo) -> list:
@@ -158,7 +220,6 @@ class GeoZarrLoadDialog(QDialog):
         parts = []
         if info.epsg:
             parts.append(f"EPSG:{info.epsg}")
-        # Extent from geotransform + largest shape
         if info.geotransform and info.shape_per_resolution:
             gt = info.geotransform
             shape = max(
@@ -168,17 +229,12 @@ class GeoZarrLoadDialog(QDialog):
             y_max = gt[3]
             x_max = x_min + gt[1] * shape[1]
             y_min = y_max + gt[5] * shape[0]
-            if info.epsg and info.epsg == 4326:
-                fmt = ".4f"
-            else:
-                fmt = ".0f"
+            fmt = ".4f" if info.epsg == 4326 else ".0f"
             parts.append(
                 f"{x_min:{fmt}}, {y_min:{fmt}} - {x_max:{fmt}}, {y_max:{fmt}}"
             )
         total_bands = sum(len(b) for b in info.bands_per_resolution.values())
-        parts.append(
-            f"{len(info.resolutions)} res, {total_bands} bands"
-        )
+        parts.append(f"{len(info.resolutions)} res, {total_bands} bands")
         if info.conventions:
             parts.append(", ".join(info.conventions))
         return parts
@@ -186,9 +242,6 @@ class GeoZarrLoadDialog(QDialog):
     def _resolution_label(self, res: str) -> str:
         """Format resolution for display: 'r10m - 10980 x 10980 (10 m/px)'."""
         shape = self._info.shape_per_resolution.get(res)
-        # Extract pixel size from name
-        import re
-
         m = re.search(r"(\d+)", res)
         px_size = m.group(1) if m else ""
         parts = [res]
@@ -204,43 +257,10 @@ class GeoZarrLoadDialog(QDialog):
         return self._info.resolutions[0] if self._info.resolutions else ""
 
     def _populate_bands(self, resolution: str) -> None:
-        # Clear existing
-        for cb in self._band_checks.values():
-            self._band_layout.removeWidget(cb)
-            cb.deleteLater()
-        self._band_checks.clear()
-
-        bands = self._info.bands_per_resolution.get(resolution, ())
-        for band in bands:
-            desc = self._info.band_descriptions.get(band, "")
-            label = band_presets.get_band_label(self._satellite, band, desc)
-            cb = QCheckBox(label)
-            tooltip = band_presets.get_band_tooltip(self._satellite, band)
-            if tooltip != band:
-                cb.setToolTip(tooltip)
-            # Store raw band name for retrieval
-            cb.setProperty("band_id", band)
-            self._band_checks[band] = cb
-            self._band_layout.addWidget(cb)
-
-        # Spacer at bottom of scroll area
-        self._band_layout.addStretch()
-
-        # Enable/disable preset buttons based on available bands
-        available = {b.upper() for b in bands}
-        for btn in self._preset_buttons:
-            preset_bands = btn.property("preset_bands")
-            btn.setEnabled(all(b.upper() in available for b in preset_bands))
-
-        # Auto-select default preset or first 3 bands
-        if self._satellite:
-            default = band_presets.default_preset(self._satellite)
-            if default:
-                self._select_bands(default)
-                return
-        for i, cb in enumerate(self._band_checks.values()):
-            if i < 3:
-                cb.setChecked(True)
+        populate_band_checkboxes(
+            self._info, resolution, self._band_layout,
+            self._band_checks, self._satellite, self._preset_buttons,
+        )
 
     def _on_resolution_changed(self, _index: int) -> None:
         self._populate_bands(self._current_resolution())

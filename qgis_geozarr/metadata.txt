@@ -3,7 +3,7 @@ name=GeoZarr
 qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
 description=GeoZarr-aware loading for QGIS STAC browser: band selection, multiscales, GDAL tuning (Zarr v2 + v3)
-version=0.1.0
+version=0.2.0
 author=Wietze Suijker
 email=
 icon=icon.svg
@@ -18,6 +18,13 @@ hasProcessingProvider=no
 about=Enhances the QGIS native STAC browser with GeoZarr features: band/resolution selection, satellite band presets (Sentinel-2, Landsat), multiscales convention support, and optimized GDAL configuration for cloud access. Supports Zarr v2 (.zmetadata) and v3 (zarr.json). Requires GDAL 3.13+.
 
 changelog=
+    0.2.0 - Time series + refactor
+    - STAC temporal navigator: search collection by date range, load as time series with temporal slider
+    - Grid/tile-aware filtering (grid:code, s2:mgrs_tile) for same-tile time series
+    - Thread safety: disconnect-before-overwrite, error signals, quit+wait cleanup
+    - Temp file robustness: atexit cleanup, try/finally on VRT creation
+    - Code quality: decomposed god methods, DRY cleanup, 73 unit tests
+    - Metadata hardening: big-endian dtypes, bytearray reads, shape parse safety
     0.1.0 - Initial release
     - Zarr v2 (.zmetadata) and v3 (zarr.json) support
     - STAC browser integration: right-click Zarr assets to load
