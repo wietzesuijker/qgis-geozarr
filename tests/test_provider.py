@@ -23,6 +23,7 @@ for mod_name, mod in [
     ("qgis.gui", MagicMock()),
     ("qgis.PyQt", types.ModuleType("qgis.PyQt")),
     ("qgis.PyQt.QtCore", _mock_qt_core),
+    ("qgis.PyQt.QtGui", MagicMock()),
     ("qgis.PyQt.QtWidgets", MagicMock()),
 ]:
     sys.modules.setdefault(mod_name, mod)
@@ -34,6 +35,7 @@ from qgis_geozarr.geozarr_provider import (  # noqa: E402
     _build_temporal_vrt,
     _extract_grid_code,
     _find_zarr_root,
+    _query_stac_items,
     _vsi_prefix,
 )
 
@@ -67,6 +69,11 @@ class TestBandUri:
     def test_no_resolution(self):
         result = _band_uri("https://example.com/data.zarr", "", "b02")
         assert result == 'ZARR:"/vsicurl/https://example.com/data.zarr/b02"'
+
+    def test_default_resolution(self):
+        """'default' resolution = flat store, no resolution segment in path."""
+        result = _band_uri("https://example.com/data.zarr", "default", "temperature")
+        assert result == 'ZARR:"/vsicurl/https://example.com/data.zarr/temperature"'
 
     def test_s3_prefix(self):
         result = _band_uri("s3://bucket/data.zarr", "r10m", "b02")
@@ -114,6 +121,15 @@ class TestExtractGridCode:
             "id": "S2C_T27WVR_test",
         }
         assert _extract_grid_code(feat) == "MGRS-25WFU"
+
+    def test_landsat_wrs(self):
+        """Landsat WRS path/row from properties."""
+        feat = {"properties": {"landsat:wrs_path": 42, "landsat:wrs_row": 34}}
+        assert _extract_grid_code(feat) == "042/034"
+
+    def test_landsat_wrs_string_values(self):
+        feat = {"properties": {"landsat:wrs_path": "42", "landsat:wrs_row": "34"}}
+        assert _extract_grid_code(feat) == "042/034"
 
     def test_no_grid_info(self):
         feat = {"id": "some-other-satellite-item", "properties": {}}
@@ -191,3 +207,112 @@ class TestBuildTemporalVrt:
 
         band = root.find("VRTRasterBand")
         assert band.get("dataType") == "UInt16"
+
+
+class TestQueryStacPagination:
+    """Tests for _query_stac_items with STAC pagination."""
+
+    @staticmethod
+    def _make_page(features, next_url=None):
+        """Build a STAC FeatureCollection response."""
+        import json as _json
+        page = {"type": "FeatureCollection", "features": features}
+        if next_url:
+            page["links"] = [{"rel": "next", "href": next_url}]
+        return _json.dumps(page).encode()
+
+    @staticmethod
+    def _make_feature(item_id, dt, zarr_url):
+        return {
+            "type": "Feature",
+            "id": item_id,
+            "properties": {"datetime": dt},
+            "assets": {
+                "zarr": {"href": zarr_url, "type": "application/x-zarr"}
+            },
+        }
+
+    def test_single_page(self, monkeypatch):
+        """Single page with enough items - no pagination needed."""
+        feats = [
+            self._make_feature(f"item{i}", f"2026-01-{i+1:02d}T00:00:00Z",
+                               f"https://ex.com/{i}.zarr")
+            for i in range(3)
+        ]
+        page = self._make_page(feats)
+        monkeypatch.setattr(
+            "qgis_geozarr.geozarr_metadata._vsi_read", lambda url: page,
+        )
+        items = _query_stac_items("https://api.example.com", "test-collection", limit=10)
+        assert len(items) == 3
+
+    def test_multi_page(self, monkeypatch):
+        """Pagination across 2 pages."""
+        page1_feats = [
+            self._make_feature("a", "2026-01-01T00:00:00Z", "https://ex.com/a.zarr"),
+            self._make_feature("b", "2026-01-02T00:00:00Z", "https://ex.com/b.zarr"),
+        ]
+        page2_feats = [
+            self._make_feature("c", "2026-01-03T00:00:00Z", "https://ex.com/c.zarr"),
+        ]
+        calls = []
+
+        def mock_read(url):
+            calls.append(url)
+            if len(calls) == 1:
+                return self._make_page(page1_feats, next_url="https://api.example.com/next")
+            return self._make_page(page2_feats)
+
+        monkeypatch.setattr("qgis_geozarr.geozarr_metadata._vsi_read", mock_read)
+        items = _query_stac_items("https://api.example.com", "test-collection", limit=10)
+        assert len(items) == 3
+        assert len(calls) == 2
+
+    def test_limit_stops_pagination(self, monkeypatch):
+        """Stop after reaching the requested limit, even if more pages exist."""
+        feats = [
+            self._make_feature(f"item{i}", f"2026-01-{i+1:02d}T00:00:00Z",
+                               f"https://ex.com/{i}.zarr")
+            for i in range(5)
+        ]
+        page = self._make_page(feats, next_url="https://api.example.com/next")
+        monkeypatch.setattr(
+            "qgis_geozarr.geozarr_metadata._vsi_read", lambda url: page,
+        )
+        items = _query_stac_items("https://api.example.com", "test-collection", limit=3)
+        assert len(items) == 3
+
+    def test_no_response_returns_empty(self, monkeypatch):
+        monkeypatch.setattr(
+            "qgis_geozarr.geozarr_metadata._vsi_read", lambda url: None,
+        )
+        items = _query_stac_items("https://api.example.com", "test-collection")
+        assert items == []
+
+    def test_grid_filter_with_pagination(self, monkeypatch):
+        """Grid filtering works across paginated results."""
+        page1_feats = [
+            {**self._make_feature("a", "2026-01-01T00:00:00Z", "https://ex.com/a.zarr"),
+             "properties": {"datetime": "2026-01-01T00:00:00Z", "grid:code": "TILE-A"}},
+            {**self._make_feature("b", "2026-01-02T00:00:00Z", "https://ex.com/b.zarr"),
+             "properties": {"datetime": "2026-01-02T00:00:00Z", "grid:code": "TILE-B"}},
+        ]
+        page2_feats = [
+            {**self._make_feature("c", "2026-01-03T00:00:00Z", "https://ex.com/c.zarr"),
+             "properties": {"datetime": "2026-01-03T00:00:00Z", "grid:code": "TILE-A"}},
+        ]
+        calls = []
+
+        def mock_read(url):
+            calls.append(url)
+            if len(calls) == 1:
+                return self._make_page(page1_feats, next_url="https://api.example.com/next")
+            return self._make_page(page2_feats)
+
+        monkeypatch.setattr("qgis_geozarr.geozarr_metadata._vsi_read", mock_read)
+        items = _query_stac_items(
+            "https://api.example.com", "test-collection",
+            limit=10, grid_code="TILE-A",
+        )
+        assert len(items) == 2
+        assert all(it["id"] in ("a", "c") for it in items)

@@ -201,19 +201,19 @@ class TestParseConsolidated:
         assert "spatial_ref" not in bands_per_res.get("r10m", [])
         assert "x" not in bands_per_res.get("r10m", [])
 
-    def test_single_segment_path_skipped(self):
-        """Paths with < 2 segments should be skipped."""
+    def test_single_segment_path_flat_fallback(self):
+        """Paths with < 2 segments: not a resolution group, but picked up by flat fallback."""
         consol = {"b02": {"node_type": "array", "shape": [100, 100]}}
         shape_per_res = {}
         bands, _, _ = _parse_consolidated(consol, shape_per_res)
-        assert bands == {}
+        assert bands == {"default": ["b02"]}
 
-    def test_non_resolution_segment_skipped(self):
-        """Paths where second-to-last is not r\\d+m should be skipped."""
+    def test_non_resolution_segment_flat_fallback(self):
+        """Paths where second-to-last is not r\\d+m: flat fallback discovers them."""
         consol = {"data/b02": {"node_type": "array", "shape": [100, 100]}}
         shape_per_res = {}
         bands, _, _ = _parse_consolidated(consol, shape_per_res)
-        assert bands == {}
+        assert bands == {"default": ["b02"]}
 
     def test_group_nodes_skipped(self):
         consol = {"r10m/b02": {"node_type": "group"}}
@@ -260,3 +260,106 @@ class TestSubgroupCrs:
         """When root attributes have CRS, sub-group CRS is not needed."""
         info = _parse(sample_v3_zarr_json)
         assert info.epsg == 32627  # from root, not sub-group
+
+
+class TestFlatZarrFallback:
+    """Flat Zarr stores without resolution groups (no r10m/r20m pattern)."""
+
+    def test_consolidated_flat_arrays(self):
+        """Arrays directly at root level, no resolution groups."""
+        root = {
+            "consolidated_metadata": {
+                "metadata": {
+                    "temperature": {
+                        "node_type": "array",
+                        "shape": [720, 1440],
+                        "data_type": "float32",
+                    },
+                    "precipitation": {
+                        "node_type": "array",
+                        "shape": [720, 1440],
+                        "data_type": "float32",
+                    },
+                    "spatial_ref": {
+                        "node_type": "array",
+                        "shape": [1],
+                    },
+                },
+            },
+        }
+        info = _parse(root)
+        assert "default" in info.bands_per_resolution
+        assert "temperature" in info.bands_per_resolution["default"]
+        assert "precipitation" in info.bands_per_resolution["default"]
+        assert "spatial_ref" not in info.bands_per_resolution["default"]
+        assert info.shape_per_resolution["default"] == (720, 1440)
+        assert info.dtype_per_resolution.get("default") == "Float32"
+
+    def test_members_flat_arrays(self):
+        """v3 members with arrays directly under root (no resolution groups)."""
+        root = {
+            "zarr_format": 3,
+            "node_type": "group",
+            "members": {
+                "wind_speed": {"node_type": "array"},
+                "wind_dir": {"node_type": "array"},
+                "spatial_ref": {"node_type": "array"},
+            },
+        }
+        info = _parse(root)
+        assert "default" in info.bands_per_resolution
+        assert "wind_speed" in info.bands_per_resolution["default"]
+        assert "wind_dir" in info.bands_per_resolution["default"]
+        assert "spatial_ref" not in info.bands_per_resolution["default"]
+
+    def test_resolution_groups_take_precedence(self, sample_v3_zarr_json):
+        """When resolution groups exist, flat fallback is not used."""
+        info = _parse(sample_v3_zarr_json)
+        assert "default" not in info.bands_per_resolution
+        assert "r10m" in info.bands_per_resolution
+
+    def test_flat_consolidated_with_prefix(self):
+        """Flat arrays under a prefix but no resolution segment."""
+        root = {
+            "consolidated_metadata": {
+                "metadata": {
+                    "data/temperature": {
+                        "node_type": "array",
+                        "shape": [360, 720],
+                        "data_type": "float64",
+                    },
+                    "data/humidity": {
+                        "node_type": "array",
+                        "shape": [360, 720],
+                        "data_type": "float64",
+                    },
+                },
+            },
+        }
+        info = _parse(root)
+        assert "default" in info.bands_per_resolution
+        assert "temperature" in info.bands_per_resolution["default"]
+        assert "humidity" in info.bands_per_resolution["default"]
+
+    def test_1d_arrays_excluded(self):
+        """1D arrays (coordinate axes) should not be treated as bands."""
+        root = {
+            "consolidated_metadata": {
+                "metadata": {
+                    "temperature": {
+                        "node_type": "array",
+                        "shape": [720, 1440],
+                        "data_type": "float32",
+                    },
+                    "lat": {
+                        "node_type": "array",
+                        "shape": [720],
+                        "data_type": "float64",
+                    },
+                },
+            },
+        }
+        info = _parse(root)
+        assert "temperature" in info.bands_per_resolution["default"]
+        # 1D array should not be included (shape check: need >= 2D)
+        assert "lat" not in info.bands_per_resolution.get("default", [])

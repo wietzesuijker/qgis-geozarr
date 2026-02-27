@@ -281,6 +281,16 @@ def _parse(root: Dict[str, Any]) -> ZarrRootInfo:
                 if bands:
                     bands_per_res[key] = bands
 
+    # Flat members fallback: arrays directly under root (no resolution groups)
+    if not bands_per_res:
+        flat_bands = [
+            k for k, v in root.get("members", {}).items()
+            if isinstance(v, dict) and v.get("node_type") == "array"
+            and k not in _NON_BAND
+        ]
+        if flat_bands:
+            bands_per_res["default"] = flat_bands
+
     # Extract band descriptions, scale_factor, valid_range from attributes
     band_descriptions: Dict[str, str] = {}
     scale_per_band: Dict[str, float] = {}
@@ -484,6 +494,33 @@ def _parse_consolidated(
                     dtype_per_res[res_seg] = gdal_dtype
 
     if not groups:
+        # Fallback: flat Zarr store with no resolution groups.
+        # Treat all 2D leaf arrays as a single "default" resolution.
+        flat_bands: List[str] = []
+        for path, meta in consol.items():
+            if not isinstance(meta, dict) or meta.get("node_type") != "array":
+                continue
+            leaf = path.strip("/").rsplit("/", 1)[-1]
+            if leaf in _NON_BAND:
+                continue
+            shape = meta.get("shape")
+            if not isinstance(shape, (list, tuple)) or len(shape) < 2:
+                continue
+            flat_bands.append(leaf)
+            if "default" not in shape_per_res:
+                try:
+                    shape_per_res["default"] = (int(shape[-2]), int(shape[-1]))
+                except (ValueError, TypeError):
+                    pass
+            if dtype_per_res is not None and "default" not in dtype_per_res:
+                zarr_dtype = meta.get("data_type")
+                if isinstance(zarr_dtype, str):
+                    gdal_dtype = _ZARR_TO_GDAL_DTYPE.get(zarr_dtype.lower())
+                    if gdal_dtype:
+                        dtype_per_res["default"] = gdal_dtype
+        if flat_bands:
+            log.debug("Flat Zarr fallback: %d bands (no resolution groups)", len(flat_bands))
+            return {"default": flat_bands}, "", shape_per_res
         return {}, "", shape_per_res
 
     # Pick prefix with the most total bands

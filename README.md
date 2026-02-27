@@ -43,10 +43,7 @@ Download `qgis_geozarr.zip` from [Releases](https://github.com/wietzesuijker/qgi
 ### Known limitations
 
 - Requires GDAL 3.13+ (Zarr v3 sharding support). QGIS 3.44 ships this by default.
-- Zarr stores must include CRS metadata (`proj:code`, `proj:projjson`, or EOPF `other_metadata`).
-- Band arrays must be organized under resolution groups (e.g. `r10m/b02`, `r20m/b05`).
-- Time series queries return up to ~50 items per search (no pagination yet).
-- Grid/tile filtering uses Sentinel-2 conventions (`grid:code`, `s2:mgrs_tile`).
+- CRS metadata (`proj:code`, `proj:projjson`, or EOPF `other_metadata`) recommended; warns if absent.
 
 ## License
 

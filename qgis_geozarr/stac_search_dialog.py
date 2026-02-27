@@ -138,7 +138,7 @@ class StacSearchDialog(QDialog):
 
         date_layout.addWidget(QLabel("Max:"))
         self._max_items = QSpinBox()
-        self._max_items.setRange(1, 50)
+        self._max_items.setRange(1, 500)
         self._max_items.setValue(24)
         date_layout.addWidget(self._max_items)
         layout.addWidget(date_group)

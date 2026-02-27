@@ -3,7 +3,7 @@ name=GeoZarr
 qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
 description=GeoZarr-aware loading for QGIS STAC browser: band selection, multiscales, GDAL tuning (Zarr v2 + v3)
-version=0.1.0
+version=0.1.1
 author=Wietze Suijker
 email=
 icon=icon.svg
@@ -19,6 +19,12 @@ hasProcessingProvider=no
 about=Enhances the QGIS native STAC browser with GeoZarr features: band/resolution selection, satellite band presets (Sentinel-2, Landsat), multiscales convention support, and optimized GDAL configuration for cloud access. Supports Zarr v2 (.zmetadata) and v3 (zarr.json). Requires GDAL 3.13+.
 
 changelog=
+    0.1.1 - Pagination, flat Zarr, Landsat grid support
+    - STAC pagination: follows rel=next links (up to 500 items)
+    - Flat Zarr stores: arrays without resolution groups now load as single resolution
+    - Landsat WRS-2 grid filtering (landsat:wrs_path/wrs_row)
+    - User-facing warnings for missing CRS/geotransform metadata
+    - Network error logging to QGIS Message Log
     0.1.0 - Initial release
     - Zarr v2 (.zmetadata) and v3 (zarr.json) support
     - STAC browser integration: right-click Zarr assets to load

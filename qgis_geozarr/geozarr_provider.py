@@ -243,7 +243,8 @@ def _extract_grid_code(feat: dict) -> str:
     Checks (in order):
     1. grid:code property (STAC Grid Extension, e.g. "MGRS-25WFU")
     2. s2:mgrs_tile property (Sentinel-2 extension)
-    3. Sentinel-2 MGRS tile from item ID (regex fallback)
+    3. landsat:wrs_path + landsat:wrs_row (Landsat WRS-2, e.g. "042/034")
+    4. Sentinel-2 MGRS tile from item ID (regex fallback)
     """
     props = feat.get("properties", {})
     gc = props.get("grid:code")
@@ -252,8 +253,15 @@ def _extract_grid_code(feat: dict) -> str:
     mgrs = props.get("s2:mgrs_tile")
     if mgrs:
         return str(mgrs)
+    wrs_path = props.get("landsat:wrs_path")
+    wrs_row = props.get("landsat:wrs_row")
+    if wrs_path is not None and wrs_row is not None:
+        return f"{int(wrs_path):03d}/{int(wrs_row):03d}"
     m = _TILE_RE.search(feat.get("id", ""))
     return m.group(1) if m else ""
+
+
+_MAX_PAGES = 10  # safety cap on pagination
 
 
 def _query_stac_items(
@@ -261,45 +269,66 @@ def _query_stac_items(
     bbox: tuple = None, datetime_range: str = None, limit: int = 24,
     grid_code: str = "",
 ) -> list:
-    """Query STAC items endpoint. Returns sorted list of dicts.
+    """Query STAC items endpoint with pagination. Returns sorted list of dicts.
 
-    If grid_code is set, filters to items matching that grid/tile code
-    and requests extra items to compensate for filtering.
+    Follows STAC ``rel=next`` links until *limit* matching items are collected
+    or no more pages exist (capped at _MAX_PAGES requests).
     """
-    # Request more if filtering by grid (multiple tiles per bbox)
-    request_limit = limit * 6 if grid_code else limit
-    url = f"{base_url}/collections/{collection_id}/items?limit={request_limit}"
+    page_size = min(limit * 6, 250) if grid_code else min(limit, 250)
+    url = f"{base_url}/collections/{collection_id}/items?limit={page_size}"
     if bbox:
         url += f"&bbox={','.join(f'{v:.6f}' for v in bbox)}"
     if datetime_range:
         url += f"&datetime={datetime_range}"
 
-    data = geozarr_metadata._vsi_read(url)
-    if not data:
-        return []
-
-    try:
-        result = json.loads(data)
-    except (json.JSONDecodeError, ValueError):
-        return []
-
     items = []
-    for feat in result.get("features", []):
-        if not isinstance(feat, dict):
-            continue
-        if grid_code and _extract_grid_code(feat) != grid_code:
-            continue
-        props = feat.get("properties", {})
-        dt = props.get("datetime")
-        href, _ = _extract_zarr_href(feat.get("assets", {}))
-        if dt and href:
-            item = {
-                "datetime": dt, "zarr_url": href, "id": feat.get("id", ""),
-            }
-            cc = props.get("eo:cloud_cover")
-            if cc is not None:
-                item["cloud_cover"] = cc
-            items.append(item)
+    for _page in range(_MAX_PAGES):
+        data = geozarr_metadata._vsi_read(url)
+        if not data:
+            if not items:
+                QgsMessageLog.logMessage(
+                    f"STAC query failed: no response from {url}", TAG, Qgis.Warning,
+                )
+            break
+
+        try:
+            result = json.loads(data)
+        except (json.JSONDecodeError, ValueError):
+            QgsMessageLog.logMessage(
+                f"STAC query: invalid JSON from {url}", TAG, Qgis.Warning,
+            )
+            break
+
+        for feat in result.get("features", []):
+            if not isinstance(feat, dict):
+                continue
+            if grid_code and _extract_grid_code(feat) != grid_code:
+                continue
+            props = feat.get("properties", {})
+            dt = props.get("datetime")
+            href, _ = _extract_zarr_href(feat.get("assets", {}))
+            if dt and href:
+                item = {
+                    "datetime": dt, "zarr_url": href, "id": feat.get("id", ""),
+                }
+                cc = props.get("eo:cloud_cover")
+                if cc is not None:
+                    item["cloud_cover"] = cc
+                items.append(item)
+
+        if len(items) >= limit:
+            break
+
+        # Follow rel=next link for pagination
+        next_url = ""
+        for link in result.get("links", []):
+            if isinstance(link, dict) and link.get("rel") == "next":
+                next_url = link.get("href", "")
+                break
+        if not next_url:
+            break
+        url = next_url
+
     items.sort(key=lambda x: x["datetime"])
     return items[:limit]
 
@@ -661,10 +690,23 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
             QMessageBox.warning(
                 None, TAG,
                 "No bands found in metadata.\n\n"
-                "Expected resolution groups (r10m, r20m) containing "
-                "band arrays. The dataset may not follow GeoZarr conventions.",
+                "Expected resolution groups (r10m, r20m) or flat band arrays. "
+                "The dataset may not follow GeoZarr conventions.",
             )
             return False
+
+        if not info.epsg:
+            QgsMessageLog.logMessage(
+                "No CRS metadata found (proj:code, proj:projjson, or "
+                "other_metadata) - layer may lack georeferencing",
+                TAG, Qgis.Warning,
+            )
+        if not info.geotransform:
+            QgsMessageLog.logMessage(
+                "No geotransform found (spatial:transform) - layer may "
+                "lack spatial positioning",
+                TAG, Qgis.Warning,
+            )
         return True
 
     def _load_timeseries(self, item: QgsDataItem) -> None:
@@ -803,7 +845,11 @@ def _vsi_prefix(url: str) -> str:
 
 def _band_uri(zarr_url: str, resolution: str, band: str, sub_group: str = "") -> str:
     base = f"{zarr_url}/{sub_group}" if sub_group else zarr_url
-    path = f"{base}/{resolution}/{band}" if resolution else f"{base}/{band}"
+    # "default" = flat store with no resolution segment in the path
+    if resolution and resolution != "default":
+        path = f"{base}/{resolution}/{band}"
+    else:
+        path = f"{base}/{band}"
     prefix = _vsi_prefix(path)
     if prefix == "/vsis3/":
         path = path[5:]
