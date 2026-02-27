@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Optional, Tuple
 
+from qgis.core import QgsSettings
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QPixmap
 from qgis.PyQt.QtWidgets import (
@@ -35,6 +36,7 @@ def populate_band_checkboxes(
     satellite: Optional[str],
     preset_buttons: Optional[List[QPushButton]] = None,
     auto_select: bool = True,
+    on_change=None,
 ) -> None:
     """Populate band checkboxes into a layout. Shared by load + time series dialogs."""
     # Clear existing
@@ -52,6 +54,8 @@ def populate_band_checkboxes(
         if tooltip != b:
             cb.setToolTip(tooltip)
         cb.setProperty("band_id", b)
+        if on_change:
+            cb.toggled.connect(on_change)
         band_checks[b] = cb
         band_layout.addWidget(cb)
 
@@ -92,8 +96,8 @@ class GeoZarrLoadDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle("Load GeoZarr")
-        self.setMinimumWidth(460)
-        self.setMinimumHeight(400)
+        self.setMinimumWidth(540)
+        self.setMinimumHeight(500)
         self._info = info
         self._item_name = item_name
         self._stac_props = stac_properties or {}
@@ -203,7 +207,8 @@ class GeoZarrLoadDialog(QDialog):
     def _build_band_area(self, layout):
         """Scrollable band checkbox area with All/None buttons."""
         bands_header = QHBoxLayout()
-        bands_header.addWidget(QLabel("<b>Bands</b>"))
+        self._bands_label = QLabel("<b>Bands</b>")
+        bands_header.addWidget(self._bands_label)
         bands_header.addStretch()
         btn_all = QPushButton("All")
         btn_all.setFixedWidth(40)
@@ -250,10 +255,24 @@ class GeoZarrLoadDialog(QDialog):
         self._update_stretch_defaults()
 
     def _update_stretch_defaults(self):
-        """Pre-populate stretch range from metadata, satellite, or dtype."""
+        """Pre-populate stretch range from saved settings, metadata, satellite, or dtype."""
         res = self._current_resolution()
         info = self._info
         dtype = info.dtype_per_resolution.get(res, "")
+
+        # Priority 0: restore last user-set stretch for this (satellite, dtype)
+        sat_key = self._satellite or "generic"
+        settings_key = f"GeoZarr/stretch/{sat_key}/{dtype}"
+        s = QgsSettings()
+        saved_lo = s.value(f"{settings_key}/min")
+        saved_hi = s.value(f"{settings_key}/max")
+        if saved_lo is not None and saved_hi is not None:
+            try:
+                self._stretch_min.setValue(float(saved_lo))
+                self._stretch_max.setValue(float(saved_hi))
+                return
+            except (ValueError, TypeError):
+                pass
 
         # Try metadata valid_range (first band with data wins)
         bands = info.bands_per_resolution.get(res, ())
@@ -334,7 +353,16 @@ class GeoZarrLoadDialog(QDialog):
         if stac_props:
             cc = stac_props.get("eo:cloud_cover")
             if cc is not None:
-                parts.append(f"Cloud: {cc:.0f}%")
+                if cc < 20:
+                    cc_color = "#2a7"
+                elif cc < 50:
+                    cc_color = "#c90"
+                else:
+                    cc_color = "#c33"
+                parts.append(
+                    f"<span style='color:{cc_color}; font-weight:bold'>"
+                    f"Cloud: {cc:.0f}%</span>"
+                )
             proc = stac_props.get("processing:level") or stac_props.get(
                 "processing_level"
             )
@@ -349,7 +377,7 @@ class GeoZarrLoadDialog(QDialog):
         return parts
 
     def _resolution_label(self, res: str) -> str:
-        """Format resolution for display: 'r10m - 10980 x 10980 (10 m/px)'."""
+        """Format resolution for display: 'r10m - 10980 x 10980 (10 m/px, ~450 MB)'."""
         shape = self._info.shape_per_resolution.get(res)
         m = re.search(r"(\d+)", res)
         px_size = m.group(1) if m else ""
@@ -358,6 +386,15 @@ class GeoZarrLoadDialog(QDialog):
             parts.append(f"{shape[1]} x {shape[0]}")
         if px_size:
             parts.append(f"{px_size} m/px")
+        if shape:
+            dtype = self._info.dtype_per_resolution.get(res, "")
+            bpp = {"Byte": 1, "UInt16": 2, "Int16": 2, "UInt32": 4,
+                    "Int32": 4, "Float32": 4, "Float64": 8}.get(dtype, 2)
+            size_mb = shape[0] * shape[1] * bpp * 3 / 1e6
+            if size_mb >= 1000:
+                parts.append(f"~{size_mb / 1000:.1f} GB/3 bands")
+            else:
+                parts.append(f"~{size_mb:.0f} MB/3 bands")
         return " - ".join(parts)
 
     def _current_resolution(self) -> str:
@@ -369,7 +406,11 @@ class GeoZarrLoadDialog(QDialog):
         populate_band_checkboxes(
             self._info, resolution, self._band_layout,
             self._band_checks, self._satellite, self._preset_buttons,
+            on_change=self._update_preset_highlight,
         )
+        count = len(self._band_checks)
+        self._bands_label.setText(f"<b>Bands ({count})</b>")
+        self._update_preset_highlight()
         # Record default preset order so selected_bands() returns R,G,B
         if self._satellite:
             default = band_presets.default_preset(self._satellite)
@@ -379,6 +420,18 @@ class GeoZarrLoadDialog(QDialog):
     def _on_resolution_changed(self, _index: int) -> None:
         self._populate_bands(self._current_resolution())
         self._update_stretch_defaults()
+
+    def _update_preset_highlight(self, _checked=None) -> None:
+        """Highlight the preset button matching current band selection."""
+        selected = {b.upper() for b in self.selected_bands()}
+        for btn in self._preset_buttons:
+            pbands = btn.property("preset_bands")
+            if pbands and {b.upper() for b in pbands} == selected:
+                btn.setStyleSheet(
+                    "QPushButton { font-weight: bold; border: 2px solid #4a90d9; }"
+                )
+            else:
+                btn.setStyleSheet("")
 
     def _apply_preset(self, preset_name: str) -> None:
         presets = band_presets.get_presets(self._satellite)
@@ -429,6 +482,17 @@ class GeoZarrLoadDialog(QDialog):
                 upper_to_actual = {b.upper(): b for b in checked}
                 return [upper_to_actual[b.upper()] for b in self._last_preset_bands]
         return checked
+
+    def accept(self):
+        """Save stretch range to settings before closing."""
+        res = self._current_resolution()
+        dtype = self._info.dtype_per_resolution.get(res, "")
+        if dtype:
+            sat_key = self._satellite or "generic"
+            key = f"GeoZarr/stretch/{sat_key}/{dtype}"
+            QgsSettings().setValue(f"{key}/min", self._stretch_min.value())
+            QgsSettings().setValue(f"{key}/max", self._stretch_max.value())
+        super().accept()
 
     def layer_name(self) -> str:
         return self._name_edit.text() or "GeoZarr"

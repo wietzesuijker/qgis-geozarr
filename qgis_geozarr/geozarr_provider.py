@@ -10,6 +10,7 @@ import re
 import tempfile
 import threading
 import xml.etree.ElementTree as ET
+from collections import OrderedDict
 
 from osgeo import gdal, osr
 
@@ -40,6 +41,14 @@ from .geozarr_dialog import GeoZarrLoadDialog
 
 TAG = "GeoZarr"
 log = logging.getLogger(__name__)
+
+
+def _error_dialog(msg: str, detail: str = "") -> None:
+    """Show a warning dialog with optional expandable detail."""
+    box = QMessageBox(QMessageBox.Icon.Warning, TAG, msg)
+    if detail:
+        box.setDetailedText(detail)
+    box.exec()
 
 # Track temp VRT files for cleanup
 _temp_files: set = set()
@@ -80,7 +89,7 @@ def _clean_gdal_uri(raw: str) -> str:
     return raw
 
 
-_stac_cache: dict = {}  # URL -> parsed JSON, capped at _STAC_CACHE_MAX
+_stac_cache: OrderedDict = OrderedDict()  # URL -> parsed JSON, LRU eviction
 _stac_cache_lock = threading.Lock()
 _STAC_CACHE_MAX = 50
 
@@ -89,6 +98,7 @@ def _fetch_stac_item_json(stac_item_url: str) -> dict:
     """Fetch a STAC item JSON with caching. Returns empty dict on failure."""
     with _stac_cache_lock:
         if stac_item_url in _stac_cache:
+            _stac_cache.move_to_end(stac_item_url)
             return _stac_cache[stac_item_url]
     try:
         data = geozarr_metadata._vsi_read(stac_item_url)
@@ -96,7 +106,7 @@ def _fetch_stac_item_json(stac_item_url: str) -> dict:
             result = json.loads(data)
             with _stac_cache_lock:
                 if len(_stac_cache) >= _STAC_CACHE_MAX:
-                    _stac_cache.pop(next(iter(_stac_cache)), None)
+                    _stac_cache.popitem(last=False)
                 _stac_cache[stac_item_url] = result
             return result
     except (json.JSONDecodeError, OSError) as e:
@@ -226,8 +236,8 @@ class _ProviderFetchThread(QThread):
             try:
                 ds = gdal.Open(uri)
                 del ds
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("Pre-warm failed for %s: %s", uri, e)
 
         workers = min(len(uris), 8)
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -395,6 +405,8 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
         self._iface = iface
         self._fetch_thread = None
         self._pending = {}
+        self._pending_thumbnail = None
+        self._pending_dialog = None
 
     def name(self) -> str:
         return "GeoZarr"
@@ -582,9 +594,7 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
             item_name = self._stac_item_name(item)
             stac_api_url = self._build_stac_api_url(item)
             if not stac_api_url:
-                QMessageBox.warning(
-                    None,
-                    TAG,
+                _error_dialog(
                     "No Zarr assets found in this STAC item.\n\n"
                     "The item may use a different format (COG, NetCDF).",
                 )
@@ -602,9 +612,18 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
 
         # Disconnect old thread to prevent double-click race
         self._disconnect_thread(self._fetch_thread)
+        self._pending_thumbnail = None
+        self._pending_dialog = None
         self._fetch_thread = _ProviderFetchThread(zarr_url, stac_api_url)
         self._fetch_thread.finished.connect(self._on_fetch_done)
+        self._fetch_thread.thumbnail_ready.connect(self._on_thumbnail_ready)
         self._fetch_thread.start()
+
+    def _on_thumbnail_ready(self, data: bytes) -> None:
+        """Cache thumbnail; forward to dialog if already open."""
+        self._pending_thumbnail = data
+        if self._pending_dialog is not None:
+            self._pending_dialog.set_thumbnail(data)
 
     def _on_fetch_done(self, info, zarr_url) -> None:
         """Handle completed metadata fetch (main thread)."""
@@ -632,21 +651,25 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
             item_name=item_name,
             stac_properties=stac_props,
         )
-        # Thumbnail arrives async - connect signal to dialog update
-        if self._fetch_thread:
-            self._fetch_thread.thumbnail_ready.connect(dlg.set_thumbnail)
+        self._pending_dialog = dlg
+        # Apply cached thumbnail if it arrived before dialog was created
+        if self._pending_thumbnail:
+            dlg.set_thumbnail(self._pending_thumbnail)
+
         if dlg.exec() != QDialog.DialogCode.Accepted:
+            self._cleanup_fetch_thread()
             return
 
         # Wait for pre-warm to finish (runs after finished.emit in thread).
-        # With smart pre-warm (~12 URIs, no ReadRaster) this typically
-        # completes within dialog interaction time.
         if self._fetch_thread and self._fetch_thread.isRunning():
             self._fetch_thread.wait(8000)
 
+        self._pending_dialog = None
+        self._pending_thumbnail = None
+
         bands = dlg.selected_bands()
         if not bands:
-            QMessageBox.warning(None, TAG, "No bands selected.")
+            _error_dialog("No bands selected.")
             return
 
         from . import band_presets
@@ -672,23 +695,21 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
         """Check fetch result and show error dialog if invalid. Returns True if OK."""
         if info is None:
             if not zarr_url:
-                QMessageBox.warning(
-                    None, TAG,
+                _error_dialog(
                     "No Zarr assets found in this STAC item.\n\n"
                     "The item may use a different format (COG, NetCDF).",
                 )
             else:
-                QMessageBox.warning(
-                    None, TAG,
-                    f"Could not read metadata from:\n{zarr_url}\n\n"
+                _error_dialog(
+                    "Could not read metadata.",
+                    detail=f"URL: {zarr_url}\n\n"
                     "Check that the URL points to a Zarr store root "
                     "(.zarr directory).",
                 )
             return False
 
         if not info.resolutions or not any(info.bands_per_resolution.values()):
-            QMessageBox.warning(
-                None, TAG,
+            _error_dialog(
                 "No bands found in metadata.\n\n"
                 "Expected resolution groups (r10m, r20m) or flat band arrays. "
                 "The dataset may not follow GeoZarr conventions.",
@@ -713,10 +734,7 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
         """Show time series search dialog for a STAC collection."""
         ctx = self._build_stac_context(item)
         if not ctx:
-            QMessageBox.warning(
-                None, TAG,
-                "Could not resolve STAC connection for this item.",
-            )
+            _error_dialog("Could not resolve STAC connection for this item.")
             return
 
         # Fetch item JSON for datetime + bbox defaults
@@ -764,6 +782,7 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
         dlg.set_search_callback(on_search)
 
         if dlg.exec() != QDialog.DialogCode.Accepted:
+            self._cleanup_search_thread(dlg)
             return
 
         # Build VRT and create layer
@@ -781,7 +800,7 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
         try:
             vrt_path = _build_temporal_vrt(items, band, resolution, info)
             if not vrt_path:
-                QMessageBox.warning(None, TAG, "Failed to build temporal VRT.")
+                _error_dialog("Failed to build temporal VRT.")
                 return
             if band not in layer_name:
                 layer_name = f"{layer_name} {band}"
@@ -818,6 +837,15 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
             log.debug("Map extent transform failed: %s", e, exc_info=True)
             return None
 
+    def _cleanup_fetch_thread(self) -> None:
+        """Stop fetch/pre-warm thread and clear pending state."""
+        if self._fetch_thread and self._fetch_thread.isRunning():
+            self._disconnect_thread(self._fetch_thread)
+            self._fetch_thread.quit()
+            self._fetch_thread.wait(3000)
+        self._pending_dialog = None
+        self._pending_thumbnail = None
+
     @staticmethod
     def _disconnect_thread(thread) -> None:
         """Safely disconnect a QThread's signals to prevent stale callbacks."""
@@ -828,12 +856,22 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
         except (RuntimeError, TypeError):
             pass
 
+    @staticmethod
+    def _cleanup_search_thread(dlg) -> None:
+        """Stop search thread stored on a dialog."""
+        thread = getattr(dlg, "_search_thread", None)
+        if thread and thread.isRunning():
+            try:
+                thread.finished.disconnect()
+                thread.error.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            thread.quit()
+            thread.wait(3000)
+
     def stop_fetch(self) -> None:
         """Cancel any running fetch thread."""
-        if self._fetch_thread and self._fetch_thread.isRunning():
-            self._disconnect_thread(self._fetch_thread)
-            self._fetch_thread.quit()
-            self._fetch_thread.wait(3000)
+        self._cleanup_fetch_thread()
         self._fetch_thread = None
 
 
@@ -917,9 +955,7 @@ def _create_single_band_layer(zarr_url, band, resolution, layer_name, info) -> N
     uri = _band_uri(zarr_url, resolution, band)
     layer = QgsRasterLayer(uri, layer_name, "gdal")
     if not layer.isValid():
-        QMessageBox.warning(
-            None, TAG, f"Failed to load layer:\n{layer.error().message()}",
-        )
+        _error_dialog("Failed to load layer.", detail=layer.error().message())
         return
     if info.epsg and not layer.crs().isValid():
         layer.setCrs(QgsCoordinateReferenceSystem(f"EPSG:{info.epsg}"))
@@ -1038,9 +1074,8 @@ def _create_multiband_vrt_layer(
     log.debug("VRT build: %.3fs", t_vrt - t0)
 
     if not vrt_path:
-        QMessageBox.warning(
-            None, TAG,
-            "Failed to build VRT: missing shape metadata for "
+        _error_dialog(
+            f"Failed to build VRT: missing shape metadata for "
             f"resolution {resolution}.",
         )
         return
@@ -1050,9 +1085,7 @@ def _create_multiband_vrt_layer(
     log.debug("Layer open: %.3fs", t_open - t_vrt)
 
     if not layer.isValid():
-        QMessageBox.warning(
-            None, TAG, f"Failed to load VRT:\n{layer.error().message()}",
-        )
+        _error_dialog("Failed to load VRT.", detail=layer.error().message())
         return
 
     dtype = info.dtype_per_resolution.get(resolution, "")
@@ -1213,10 +1246,7 @@ def _create_temporal_layer(
 
     layer = QgsRasterLayer(vrt_path, layer_name, "gdal")
     if not layer.isValid():
-        QMessageBox.warning(
-            None, TAG,
-            f"Failed to load temporal VRT:\n{layer.error().message()}",
-        )
+        _error_dialog("Failed to load temporal VRT.", detail=layer.error().message())
         return
 
     # Single-band gray renderer (temporal mode switches which band is shown)

@@ -33,9 +33,11 @@ import pytest  # noqa: E402
 from qgis_geozarr.geozarr_provider import (  # noqa: E402
     _band_uri,
     _build_temporal_vrt,
+    _error_dialog,
     _extract_grid_code,
     _find_zarr_root,
     _query_stac_items,
+    _stac_cache,
     _vsi_prefix,
 )
 
@@ -316,3 +318,70 @@ class TestQueryStacPagination:
         )
         assert len(items) == 2
         assert all(it["id"] in ("a", "c") for it in items)
+
+
+class TestStacCacheLRU:
+    """Tests for OrderedDict-based STAC cache."""
+
+    def test_cache_is_ordered_dict(self):
+        from collections import OrderedDict
+        assert isinstance(_stac_cache, OrderedDict)
+
+    def test_cache_hit_moves_to_end(self, monkeypatch):
+        """Cache hit promotes entry to most-recently-used position."""
+        from qgis_geozarr.geozarr_provider import (
+            _fetch_stac_item_json, _stac_cache, _stac_cache_lock,
+        )
+        # Pre-populate cache
+        with _stac_cache_lock:
+            _stac_cache.clear()
+            _stac_cache["url-a"] = {"a": 1}
+            _stac_cache["url-b"] = {"b": 2}
+        # Hit url-a - should move to end
+        result = _fetch_stac_item_json("url-a")
+        assert result == {"a": 1}
+        with _stac_cache_lock:
+            keys = list(_stac_cache.keys())
+            assert keys[-1] == "url-a"
+            _stac_cache.clear()
+
+
+class TestErrorDialog:
+    """Tests for _error_dialog helper."""
+
+    def test_callable(self):
+        assert callable(_error_dialog)
+
+
+class TestPrewarmLogging:
+    """Test that pre-warm logs warnings on failure."""
+
+    def test_prewarm_logs_failure(self, monkeypatch):
+        import logging
+        from qgis_geozarr.geozarr_provider import _ProviderFetchThread
+        from qgis_geozarr.geozarr_metadata import ZarrRootInfo
+
+        # Create a minimal info with one band
+        info = ZarrRootInfo(
+            resolutions=["r10m"],
+            bands_per_resolution={"r10m": ["b02"]},
+            band_descriptions={},
+            shape_per_resolution={"r10m": (100, 100)},
+            dtype_per_resolution={"r10m": "UInt16"},
+            epsg=32632,
+            geotransform=(600000, 10, 0, 5000000, 0, -10),
+            conventions=[],
+            sub_group="",
+            scale_per_band={},
+            valid_range_per_band={},
+            transform_per_resolution={},
+        )
+        # Mock gdal.Open to raise
+        monkeypatch.setattr("qgis_geozarr.geozarr_provider.gdal.Open", lambda uri: (_ for _ in ()).throw(RuntimeError("test")))
+
+        with monkeypatch.context() as m:
+            warnings = []
+            m.setattr("qgis_geozarr.geozarr_provider.log.warning", lambda *a, **kw: warnings.append(a))
+            _ProviderFetchThread._prewarm_sources(info, "https://ex.com/data.zarr")
+            assert len(warnings) >= 1
+            assert "Pre-warm failed" in warnings[0][0]

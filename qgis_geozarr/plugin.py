@@ -95,29 +95,30 @@ class GeoZarrPlugin:
         self._iface.addPluginToRasterMenu("GeoZarr", self._action)
 
     def unload(self) -> None:
-        if self._fetch_thread and self._fetch_thread.isRunning():
-            try:
-                self._fetch_thread.finished.disconnect()
-            except (RuntimeError, TypeError):
-                pass
-            self._fetch_thread.quit()
-            self._fetch_thread.wait(3000)
-        self._fetch_thread = None
+        try:
+            if self._fetch_thread and self._fetch_thread.isRunning():
+                try:
+                    self._fetch_thread.finished.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
+                self._fetch_thread.quit()
+                self._fetch_thread.wait(3000)
+            self._fetch_thread = None
 
-        if self._provider:
-            self._provider.stop_fetch()
-            QgsGui.dataItemGuiProviderRegistry().removeProvider(self._provider)
-            self._provider = None
+            if self._provider:
+                self._provider.stop_fetch()
+                QgsGui.dataItemGuiProviderRegistry().removeProvider(self._provider)
+                self._provider = None
 
-        if self._action:
-            self._iface.removePluginRasterMenu("GeoZarr", self._action)
-        if self._toolbar:
-            del self._toolbar
-            self._toolbar = None
-
-        gdal_config.restore()
-        geozarr_metadata.clear_cache()
-        cleanup_temp_files()
+            if self._action:
+                self._iface.removePluginRasterMenu("GeoZarr", self._action)
+            if self._toolbar:
+                del self._toolbar
+                self._toolbar = None
+        finally:
+            gdal_config.restore()
+            geozarr_metadata.clear_cache()
+            cleanup_temp_files()
 
     def _load_from_url(self) -> None:
         """Standalone entry: paste a Zarr URL to load."""

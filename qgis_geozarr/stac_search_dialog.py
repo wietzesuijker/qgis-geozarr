@@ -225,7 +225,10 @@ class StacSearchDialog(QDialog):
         self._results_label.setStyleSheet("color: #555;")
 
         if not items:
-            self._results_label.setText("No items found")
+            self._results_label.setText(
+                "No items found - try expanding the date range or search area"
+            )
+            self._results_label.setStyleSheet("color: #c90;")
             self._band_group.setVisible(False)
             self._ok_btn.setEnabled(False)
             return
