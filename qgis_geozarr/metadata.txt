@@ -2,10 +2,10 @@
 name=GeoZarr
 qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
-description=GeoZarr-aware loading for QGIS STAC browser: band selection, multiscales, GDAL tuning (Zarr v2 + v3)
+description=Load cloud-native Zarr data from STAC: band selection, multiscale pyramids, satellite presets (Zarr v2 + v3)
 version=0.1.2
 author=Wietze Suijker
-email=
+email=wietze.suijker@gmail.com
 icon=icon.svg
 experimental=False
 supportsQt6=yes
@@ -13,41 +13,32 @@ deprecated=False
 homepage=https://github.com/wietzesuijker/qgis-geozarr
 tracker=https://github.com/wietzesuijker/qgis-geozarr/issues
 repository=https://github.com/wietzesuijker/qgis-geozarr
-tags=geozarr,zarr,stac,sentinel-2,cloud-native,raster
+tags=geozarr,zarr,stac,sentinel-2,landsat,copernicus,cloud-native,raster,time-series,multiscale
 category=Raster
 hasProcessingProvider=no
-about=Enhances the QGIS native STAC browser with GeoZarr features: band/resolution selection, satellite band presets (Sentinel-2, Landsat), multiscales convention support, and optimized GDAL configuration for cloud access. Supports Zarr v2 (.zmetadata) and v3 (zarr.json). Requires GDAL 3.13+.
+about=Right-click any Zarr asset in the QGIS STAC browser and load exactly the bands and resolution you need. Or paste a URL directly.
+    - Band and resolution picker with satellite presets (Sentinel-2, Landsat, MODIS, Sentinel-3, including EOPF)
+    - Multiscale pyramids from the multiscales convention - no extra downloads
+    - Time series: search by date range, filter by grid tile, animate with the temporal controller
+    - Auto RGB styling with stretch defaults tuned per satellite and data type
+    - Cloud-optimized out of the box (HTTP/2, parallel decode, connection pooling)
+    Zarr v2 (.zmetadata) and v3 (zarr.json), including sharded stores. Requires QGIS 3.44+.
 
 changelog=
-    0.1.2 - Thread safety, UX polish, production hardening
-    - Fix: thumbnail signal race (connect before thread.start)
-    - Fix: thread cleanup on dialog cancel (provider + time series)
-    - Fix: STAC cache LRU eviction via OrderedDict
-    - Cloud cover color badges (green/amber/red)
-    - Band count in group title, file size estimate in resolution dropdown
-    - Active preset button highlighting
-    - Stretch range persisted per satellite/dtype in QgsSettings
-    - HiDPI dialog sizing (540x500)
-    - No-results search guidance
-    - Consistent error dialogs with expandable detail
-    - Pre-warm failure logging
-    - Plugin unload robustness (try-finally)
-    0.1.1 - Pagination, flat Zarr, Landsat grid support
-    - STAC pagination: follows rel=next links (up to 500 items)
-    - Flat Zarr stores: arrays without resolution groups now load as single resolution
-    - Landsat WRS-2 grid filtering (landsat:wrs_path/wrs_row)
-    - User-facing warnings for missing CRS/geotransform metadata
-    - Network error logging to QGIS Message Log
+    0.1.2 - Thread safety, UX polish
+    - Fix thumbnail race condition, thread cleanup on cancel, cache eviction
+    - Cloud cover color badges, band counts in titles, file size estimates
+    - Stretch range remembered per satellite and data type
+    - HiDPI sizing, no-results guidance, expandable error dialogs
+    0.1.1 - Pagination, flat Zarr, Landsat grid
+    - STAC pagination up to 500 items
+    - Flat Zarr stores (no resolution groups) load as single resolution
+    - Landsat WRS-2 grid filtering for same-tile time series
     0.1.0 - Initial release
-    - Zarr v2 (.zmetadata) and v3 (zarr.json) support
-    - STAC browser integration: right-click Zarr assets to load
-    - STAC temporal navigator: search by date range, load as time series
-    - Grid/tile-aware filtering (grid:code, s2:mgrs_tile) for same-tile series
-    - Band/resolution picker with satellite presets (Sentinel-2, Landsat 8/9, MODIS, Sentinel-3)
-    - Dataset info header (EPSG, extent, band/resolution counts)
-    - Auto RGB styling with cumulative-cut stretch for 3-band composites
-    - Band descriptions from metadata in Layers panel
-    - Multiscales convention support (VRT overviews from coarser resolutions)
-    - EOPF Sentinel-2 support (L2A v2 + Explorer v3, consolidated sub-group CRS)
-    - Standalone URL loader with recent URL history
-    - Optimized GDAL config for cloud access (HTTP/2, vsicurl cache, parallel decode)
+    - Zarr v2 and v3 with automatic format detection
+    - STAC browser integration: right-click to load, or paste a URL
+    - Time series search with grid/tile-aware filtering and temporal animation
+    - Band/resolution picker with satellite presets
+    - Multiscale convention support (VRT overviews from coarser resolutions)
+    - Auto RGB styling with cumulative-cut stretch
+    - Cloud-optimized GDAL defaults (HTTP/2, vsicurl cache, parallel decode)
