@@ -6,15 +6,16 @@ GeoZarr-aware loading for the QGIS STAC browser: band selection, multiscale over
 
 ## Features
 
-- **STAC browser integration** - right-click Zarr assets to load with band/resolution selection
-- **Satellite band presets** - Sentinel-2, Landsat 8/9, MODIS, Sentinel-3 (True Color, False Color, etc.)
-- **Time series** - search STAC collections by date range, load as temporal layer with slider
+- **STAC browser integration** - right-click any STAC item to load with band/resolution selection
+- **Satellite band presets** - Sentinel-2, Landsat 8/9, MODIS, Sentinel-3 (True Color, False Color, Agriculture, etc.)
+- **Time series** - search STAC collections by date range, load as temporal layer with animation slider
 - **Multiscale overviews** - VRT overviews from coarser Zarr resolutions for smooth zoom
-- **Auto RGB styling** - cumulative-cut stretch for 3-band composites
-- **Band descriptions** - metadata names (long_name/standard_name) shown in Layers panel
-- **EOPF support** - Sentinel-2 L2A via both EOPF Production (v2) and Explorer (v3)
-- **URL loader** - standalone dialog with recent URL history
-- **GDAL tuning** - HTTP/2, connection pooling, vsicurl cache, parallel decode, shard index cache
+- **Auto RGB styling** - stretch defaults per satellite/dtype, persisted across sessions
+- **Cloud cover badges** - color-coded quality indicators in the load dialog
+- **Band descriptions** - metadata names shown in Layers panel, band count and file size estimates in UI
+- **EOPF support** - Sentinel-2 L2A via both EOPF Production (v2) and Explorer (v3, sharded)
+- **URL loader** - standalone dialog with recent URL history and clipboard paste
+- **GDAL tuning** - HTTP/2, vsicurl cache, parallel decode, shard index cache - applied automatically
 
 ## Requirements
 
@@ -31,9 +32,9 @@ Download `qgis_geozarr.zip` from [Releases](https://github.com/wietzesuijker/qgi
 
 ## Usage
 
-**Via STAC browser**: Browse a STAC catalog, right-click a Zarr asset, select "Load GeoZarr..." to open the band picker dialog.
+**Via STAC browser**: Browse a STAC catalog, right-click any item, select "Load GeoZarr..." to open the band picker. For time series, select "Load time series..." to search by date range.
 
-**Via URL loader**: Click the GeoZarr toolbar icon or go to Plugins > GeoZarr > Load from URL. Paste a Zarr store URL.
+**Via URL loader**: Click the GeoZarr toolbar icon or Plugins > GeoZarr > Load from URL. Paste a Zarr store URL.
 
 ### Tested with
 
@@ -42,8 +43,16 @@ Download `qgis_geozarr.zip` from [Releases](https://github.com/wietzesuijker/qgi
 
 ### Known limitations
 
-- Requires GDAL 3.13+ (Zarr v3 sharding support). QGIS 3.44 ships this by default.
+- Requires GDAL 3.13+ for Zarr v3 sharding. QGIS 3.44 ships this by default.
 - CRS metadata (`proj:code`, `proj:projjson`, or EOPF `other_metadata`) recommended; warns if absent.
+
+## Development
+
+```bash
+make test    # 96 tests
+make lint    # ruff check
+make zip     # build plugin zip
+```
 
 ## License
 
