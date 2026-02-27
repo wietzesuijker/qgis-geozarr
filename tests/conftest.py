@@ -97,6 +97,79 @@ def sample_v2_zmetadata():
 
 
 @pytest.fixture
+def sample_v3_subgroup_crs():
+    """Zarr v3 with empty root attributes; CRS/transforms in consolidated sub-group.
+
+    Matches real EOPF Explorer v3 structure where proj:code, multiscales,
+    and spatial:transform live in sub-group entries, not root attributes.
+    """
+    return {
+        "zarr_format": 3,
+        "node_type": "group",
+        "attributes": {},
+        "consolidated_metadata": {
+            "metadata": {
+                "measurements/reflectance": {
+                    "node_type": "group",
+                    "attributes": {
+                        "proj:code": "EPSG:32626",
+                        "multiscales": {
+                            "layout": [
+                                {
+                                    "asset": "r10m",
+                                    "spatial:shape": [10980, 10980],
+                                    "spatial:transform": [10.0, 0.0, 499980.0, 0.0, -10.0, 8000040.0],
+                                },
+                                {
+                                    "asset": "r20m",
+                                    "derived_from": "r10m",
+                                    "spatial:shape": [5490, 5490],
+                                    "spatial:transform": [20.0, 0.0, 499980.0, 0.0, -20.0, 8000040.0],
+                                },
+                            ],
+                        },
+                    },
+                },
+                "measurements/reflectance/r10m": {
+                    "node_type": "group",
+                    "attributes": {
+                        "proj:code": "EPSG:32626",
+                        "spatial:transform": [10.0, 0.0, 499980.0, 0.0, -10.0, 8000040.0],
+                    },
+                },
+                "measurements/reflectance/r10m/b02": {
+                    "node_type": "array",
+                    "shape": [10980, 10980],
+                    "data_type": "float32",
+                },
+                "measurements/reflectance/r10m/b03": {
+                    "node_type": "array",
+                    "shape": [10980, 10980],
+                    "data_type": "float32",
+                },
+                "measurements/reflectance/r10m/b04": {
+                    "node_type": "array",
+                    "shape": [10980, 10980],
+                    "data_type": "float32",
+                },
+                "measurements/reflectance/r20m": {
+                    "node_type": "group",
+                    "attributes": {
+                        "proj:code": "EPSG:32626",
+                        "spatial:transform": [20.0, 0.0, 499980.0, 0.0, -20.0, 8000040.0],
+                    },
+                },
+                "measurements/reflectance/r20m/b05": {
+                    "node_type": "array",
+                    "shape": [5490, 5490],
+                    "data_type": "float32",
+                },
+            },
+        },
+    }
+
+
+@pytest.fixture
 def sample_zarr_root_info():
     """Pre-built ZarrRootInfo for provider tests."""
     return ZarrRootInfo(

@@ -220,3 +220,43 @@ class TestParseConsolidated:
         shape_per_res = {}
         bands, _, _ = _parse_consolidated(consol, shape_per_res)
         assert bands == {}
+
+
+class TestSubgroupCrs:
+    """CRS/transform/multiscales from consolidated sub-group entries.
+
+    Real EOPF Explorer v3 data has empty root attributes; metadata lives
+    in consolidated entries like measurements/reflectance and
+    measurements/reflectance/r10m.
+    """
+
+    def test_crs_from_consolidated_subgroup(self, sample_v3_subgroup_crs):
+        info = _parse(sample_v3_subgroup_crs)
+        assert info.epsg == 32626
+
+    def test_transform_from_consolidated_subgroup(self, sample_v3_subgroup_crs):
+        info = _parse(sample_v3_subgroup_crs)
+        # spatial:transform [10,0,499980,0,-10,8000040] -> GDAL [499980,10,0,8000040,0,-10]
+        assert info.geotransform == (499980.0, 10.0, 0.0, 8000040.0, 0.0, -10.0)
+
+    def test_per_resolution_transforms(self, sample_v3_subgroup_crs):
+        info = _parse(sample_v3_subgroup_crs)
+        assert "r10m" in info.transform_per_resolution
+        assert "r20m" in info.transform_per_resolution
+        assert info.transform_per_resolution["r20m"] == (499980.0, 20.0, 0.0, 8000040.0, 0.0, -20.0)
+
+    def test_multiscales_shapes(self, sample_v3_subgroup_crs):
+        info = _parse(sample_v3_subgroup_crs)
+        assert info.shape_per_resolution["r10m"] == (10980, 10980)
+        assert info.shape_per_resolution["r20m"] == (5490, 5490)
+
+    def test_bands_still_discovered(self, sample_v3_subgroup_crs):
+        info = _parse(sample_v3_subgroup_crs)
+        assert info.sub_group == "measurements/reflectance"
+        assert "b02" in info.bands_per_resolution["r10m"]
+        assert "b05" in info.bands_per_resolution["r20m"]
+
+    def test_root_attrs_take_precedence(self, sample_v3_zarr_json):
+        """When root attributes have CRS, sub-group CRS is not needed."""
+        info = _parse(sample_v3_zarr_json)
+        assert info.epsg == 32627  # from root, not sub-group

@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import threading
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -63,6 +64,8 @@ class ZarrRootInfo:
     conventions: Tuple[str, ...] = ()
     sub_group: str = ""  # prefix path for bands (e.g. "measurements/reflectance")
     band_descriptions: Dict[str, str] = field(default_factory=dict)  # band_id -> description
+    scale_per_band: Dict[str, float] = field(default_factory=dict)  # band_id -> scale_factor
+    valid_range_per_band: Dict[str, Tuple[float, float]] = field(default_factory=dict)
 
 
 def _res_sort_key(name: str) -> int:
@@ -75,8 +78,20 @@ _cache: Dict[str, ZarrRootInfo] = {}
 _lock = threading.Lock()
 
 
+def _http_read(url: str, timeout: float = 15) -> Optional[bytes]:
+    """Read a remote file via urllib (single GET, no HEAD overhead)."""
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return None
+
+
 def _vsi_read(url: str) -> Optional[bytes]:
-    """Read a remote file via GDAL's /vsicurl/. Returns None on failure."""
+    """Read a remote file. Uses urllib for http(s), GDAL vsicurl for s3/vsi."""
+    if url.startswith(("http://", "https://")):
+        return _http_read(url)
     vsi_path = f"/vsicurl/{url}"
     fp = gdal.VSIFOpenL(vsi_path, "rb")
     if fp is None:
@@ -145,7 +160,10 @@ def fetch_resolved(zarr_url: str) -> Tuple[Optional[ZarrRootInfo], str]:
     url = zarr_url.rstrip("/")
     if info and info.sub_group:
         sub_url = f"{url}/{info.sub_group}"
-        # v3: each group has its own zarr.json
+        # Skip sub-group fetch if root consolidated already gave us everything
+        if info.resolutions and info.shape_per_resolution:
+            return info, sub_url
+        # v3: each group has its own zarr.json (non-consolidated case)
         sub_info = fetch(sub_url)
         if sub_info and sub_info.resolutions:
             return sub_info, sub_url
@@ -206,6 +224,51 @@ def _parse(root: Dict[str, Any]) -> ZarrRootInfo:
             consol, shape_per_res, dtype_per_res,
         )
 
+        # CRS/transform/multiscales may live in sub-group entries rather than
+        # root attributes (e.g. EOPF Explorer v3: measurements/reflectance).
+        if sub_group:
+            sg_meta = consol.get(sub_group, {})
+            sg_attrs = sg_meta.get("attributes", {}) if isinstance(sg_meta, dict) else {}
+            if isinstance(sg_attrs, dict):
+                if epsg is None:
+                    epsg = _parse_crs(sg_attrs)
+                if geotransform is None:
+                    geotransform = _parse_transform(sg_attrs)
+                ms = sg_attrs.get("multiscales")
+                if isinstance(ms, dict):
+                    for entry in ms.get("layout", []):
+                        if not isinstance(entry, dict):
+                            continue
+                        asset = entry.get("asset")
+                        if not asset:
+                            continue
+                        shape = entry.get("spatial:shape")
+                        if isinstance(shape, (list, tuple)) and len(shape) >= 2:
+                            shape_per_res.setdefault(asset, (int(shape[-2]), int(shape[-1])))
+                        st = entry.get("spatial:transform")
+                        if isinstance(st, (list, tuple)) and len(st) == 6:
+                            vals = [float(v) for v in st]
+                            gdal_gt = (vals[2], vals[0], vals[1],
+                                       vals[5], vals[3], vals[4])
+                            transform_per_res.setdefault(asset, gdal_gt)
+                            if geotransform is None:
+                                geotransform = gdal_gt
+
+            # Per-resolution CRS/transform from consolidated entries
+            for res in list(bands_per_res.keys()):
+                res_path = f"{sub_group}/{res}"
+                res_meta = consol.get(res_path, {})
+                res_attrs = res_meta.get("attributes", {}) if isinstance(res_meta, dict) else {}
+                if isinstance(res_attrs, dict):
+                    if epsg is None:
+                        epsg = _parse_crs(res_attrs)
+                    if res not in transform_per_res:
+                        gt = _parse_transform(res_attrs)
+                        if gt:
+                            transform_per_res[res] = gt
+                            if geotransform is None:
+                                geotransform = gt
+
     # Members fallback (inline zarr.json without consolidated_metadata)
     if not bands_per_res:
         for key, value in root.get("members", {}).items():
@@ -218,8 +281,10 @@ def _parse(root: Dict[str, Any]) -> ZarrRootInfo:
                 if bands:
                     bands_per_res[key] = bands
 
-    # Extract band descriptions from consolidated metadata attributes
+    # Extract band descriptions, scale_factor, valid_range from attributes
     band_descriptions: Dict[str, str] = {}
+    scale_per_band: Dict[str, float] = {}
+    valid_range_per_band: Dict[str, Tuple[float, float]] = {}
     for path, meta in consol.items():
         if not isinstance(meta, dict):
             continue
@@ -232,6 +297,27 @@ def _parse(root: Dict[str, Any]) -> ZarrRootInfo:
         )
         if desc and isinstance(desc, str):
             band_descriptions[band_id] = desc
+        # Scale factor (e.g. 10000 for S2 UInt16 reflectance)
+        sf = member_attrs.get("scale_factor")
+        if sf is not None:
+            try:
+                scale_per_band[band_id] = float(sf)
+            except (ValueError, TypeError):
+                pass
+        # Valid range from valid_min/valid_max or valid_range
+        vmin = member_attrs.get("valid_min")
+        vmax = member_attrs.get("valid_max")
+        vrange = member_attrs.get("valid_range")
+        if vrange is not None and isinstance(vrange, (list, tuple)) and len(vrange) == 2:
+            try:
+                valid_range_per_band[band_id] = (float(vrange[0]), float(vrange[1]))
+            except (ValueError, TypeError):
+                pass
+        elif vmin is not None and vmax is not None:
+            try:
+                valid_range_per_band[band_id] = (float(vmin), float(vmax))
+            except (ValueError, TypeError):
+                pass
 
     resolutions = sorted(bands_per_res.keys(), key=_res_sort_key)
 
@@ -246,6 +332,8 @@ def _parse(root: Dict[str, Any]) -> ZarrRootInfo:
         conventions=tuple(conventions),
         sub_group=sub_group,
         band_descriptions=band_descriptions,
+        scale_per_band=scale_per_band,
+        valid_range_per_band=valid_range_per_band,
     )
 
 
@@ -286,8 +374,10 @@ def _parse_v2(zmetadata: Dict[str, Any]) -> ZarrRootInfo:
         consol, shape_per_res, dtype_per_res,
     )
 
-    # Extract band descriptions from per-array .zattrs
+    # Extract band descriptions, scale_factor, valid_range from .zattrs
     band_descriptions: Dict[str, str] = {}
+    scale_per_band: Dict[str, float] = {}
+    valid_range_per_band: Dict[str, Tuple[float, float]] = {}
     for path, value in meta.items():
         if not path.endswith("/.zattrs") or not isinstance(value, dict):
             continue
@@ -296,6 +386,25 @@ def _parse_v2(zmetadata: Dict[str, Any]) -> ZarrRootInfo:
         desc = value.get("long_name") or value.get("standard_name", "")
         if desc and isinstance(desc, str):
             band_descriptions[band_id] = desc
+        sf = value.get("scale_factor")
+        if sf is not None:
+            try:
+                scale_per_band[band_id] = float(sf)
+            except (ValueError, TypeError):
+                pass
+        vmin = value.get("valid_min")
+        vmax = value.get("valid_max")
+        vrange = value.get("valid_range")
+        if vrange is not None and isinstance(vrange, (list, tuple)) and len(vrange) == 2:
+            try:
+                valid_range_per_band[band_id] = (float(vrange[0]), float(vrange[1]))
+            except (ValueError, TypeError):
+                pass
+        elif vmin is not None and vmax is not None:
+            try:
+                valid_range_per_band[band_id] = (float(vmin), float(vmax))
+            except (ValueError, TypeError):
+                pass
 
     resolutions = sorted(bands_per_res.keys(), key=_res_sort_key)
 
@@ -310,6 +419,8 @@ def _parse_v2(zmetadata: Dict[str, Any]) -> ZarrRootInfo:
         conventions=(),
         sub_group=sub_group,
         band_descriptions=band_descriptions,
+        scale_per_band=scale_per_band,
+        valid_range_per_band=valid_range_per_band,
     )
 
 

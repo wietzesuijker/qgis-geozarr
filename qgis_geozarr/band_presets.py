@@ -8,24 +8,25 @@ PRESETS: Dict[str, Dict[str, tuple]] = {
         "true_color": ("B04", "B03", "B02"),
         "false_color": ("B08", "B04", "B03"),
         "swir": ("B12", "B8A", "B04"),
+        "classification": ("SCL",),
         "agriculture": ("B11", "B08", "B02"),
         "geology": ("B12", "B11", "B02"),
         "urban": ("B12", "B11", "B04"),
         "moisture": ("B8A", "B11", "B12"),
-        "bathymetric": ("B04", "B03", "B01"),
     },
     "landsat-8": {
         "true_color": ("B4", "B3", "B2"),
         "false_color": ("B5", "B4", "B3"),
         "swir": ("B7", "B5", "B4"),
+        "quality": ("QA_PIXEL",),
         "agriculture": ("B6", "B5", "B2"),
         "geology": ("B7", "B6", "B2"),
-        "urban": ("B7", "B6", "B4"),
     },
     "landsat-9": {
         "true_color": ("B4", "B3", "B2"),
         "false_color": ("B5", "B4", "B3"),
         "swir": ("B7", "B5", "B4"),
+        "quality": ("QA_PIXEL",),
     },
     "modis": {
         "true_color": ("B1", "B4", "B3"),
@@ -166,8 +167,12 @@ def get_preset_tooltip(satellite: Optional[str], preset_name: str) -> str:
     bands = presets.get(preset_name)
     if not bands:
         return ""
+    if len(bands) == 1:
+        info = BAND_INFO.get(satellite.lower(), {}).get(bands[0].upper())
+        name = info[0] if info else bands[0]
+        return f"{bands[0]} ({name})"
     parts = []
-    for i, (role, band_id) in enumerate(zip(("R", "G", "B"), bands)):
+    for role, band_id in zip(("R", "G", "B"), bands):
         info = BAND_INFO.get(satellite.lower(), {}).get(band_id.upper())
         name = info[0] if info else band_id
         parts.append(f"{role}: {band_id} ({name})")

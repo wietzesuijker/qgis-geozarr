@@ -6,11 +6,13 @@ import re
 from typing import Dict, List, Optional, Tuple
 
 from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtGui import QPixmap
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -86,6 +88,7 @@ class GeoZarrLoadDialog(QDialog):
         collection_id: str = "",
         zarr_url: str = "",
         item_name: str = "",
+        stac_properties: dict = None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Load GeoZarr")
@@ -93,9 +96,12 @@ class GeoZarrLoadDialog(QDialog):
         self.setMinimumHeight(400)
         self._info = info
         self._item_name = item_name
+        self._stac_props = stac_properties or {}
         self._band_checks: Dict[str, QCheckBox] = {}
         self._preset_buttons: List[QPushButton] = []
         self._res_combo = None
+        self._thumb_label: Optional[QLabel] = None
+        self._last_preset_bands: Optional[Tuple[str, ...]] = None
         self._satellite = (
             band_presets.detect_satellite(collection_id) if collection_id else None
         )
@@ -107,13 +113,32 @@ class GeoZarrLoadDialog(QDialog):
         self._build_resolution_selector(layout, info)
         self._build_preset_buttons(layout)
         self._build_band_area(layout)
+        self._build_stretch_controls(layout)
         self._build_footer(layout, zarr_url)
 
         # Populate initial bands
         self._populate_bands(self._current_resolution())
 
+    def set_thumbnail(self, data: bytes) -> None:
+        """Called async when thumbnail arrives from fetch thread."""
+        if not data or not self._header_row:
+            return
+        pm = QPixmap()
+        pm.loadFromData(data)
+        if pm.isNull():
+            return
+        pm = pm.scaledToHeight(120, Qt.TransformationMode.SmoothTransformation)
+        self._thumb_label = QLabel()
+        self._thumb_label.setPixmap(pm)
+        self._thumb_label.setFixedSize(pm.size())
+        self._header_row.insertWidget(0, self._thumb_label, 0, Qt.AlignmentFlag.AlignTop)
+
     def _build_header(self, layout, zarr_url, info):
-        """Source URL + dataset info summary."""
+        """Source URL + thumbnail + dataset info summary."""
+        self._header_row = QHBoxLayout()
+
+        # Text info (thumbnail inserted async via set_thumbnail)
+        text_col = QVBoxLayout()
         if zarr_url:
             url_edit = QLineEdit(zarr_url)
             url_edit.setReadOnly(True)
@@ -122,9 +147,9 @@ class GeoZarrLoadDialog(QDialog):
                 "QLineEdit { background: transparent; color: #666; font-size: 11px; }"
             )
             url_edit.setToolTip("Source URL (select to copy)")
-            layout.addWidget(url_edit)
+            text_col.addWidget(url_edit)
 
-        info_parts = self._build_info_lines(info)
+        info_parts = self._build_info_lines(info, self._stac_props)
         if info_parts:
             info_label = QLabel(
                 "<span style='color:#555; font-size:11px'>"
@@ -132,8 +157,12 @@ class GeoZarrLoadDialog(QDialog):
                 + "</span>"
             )
             info_label.setWordWrap(True)
-            info_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            layout.addWidget(info_label)
+            info_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            text_col.addWidget(info_label)
+
+        text_col.addStretch()
+        self._header_row.addLayout(text_col, 1)
+        layout.addLayout(self._header_row)
 
     def _build_resolution_selector(self, layout, info):
         """Resolution combo box (shown only when > 1 resolution)."""
@@ -196,9 +225,73 @@ class GeoZarrLoadDialog(QDialog):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(self._band_widget)
-        scroll.setFrameShape(scroll.NoFrame)
+        scroll.setFrameShape(scroll.Shape.NoFrame)
         scroll.setMinimumHeight(180)
         layout.addWidget(scroll, stretch=1)
+
+    def _build_stretch_controls(self, layout):
+        """Min/max stretch range for RGB display."""
+        stretch_layout = QHBoxLayout()
+        stretch_layout.addWidget(QLabel("Stretch:"))
+        self._stretch_min = QDoubleSpinBox()
+        self._stretch_min.setDecimals(4)
+        self._stretch_min.setRange(-1e9, 1e9)
+        self._stretch_min.setToolTip("Minimum value for RGB stretch")
+        self._stretch_max = QDoubleSpinBox()
+        self._stretch_max.setDecimals(4)
+        self._stretch_max.setRange(-1e9, 1e9)
+        self._stretch_max.setToolTip("Maximum value for RGB stretch")
+        stretch_layout.addWidget(QLabel("Min"))
+        stretch_layout.addWidget(self._stretch_min)
+        stretch_layout.addWidget(QLabel("Max"))
+        stretch_layout.addWidget(self._stretch_max)
+        stretch_layout.addStretch()
+        layout.addLayout(stretch_layout)
+        self._update_stretch_defaults()
+
+    def _update_stretch_defaults(self):
+        """Pre-populate stretch range from metadata, satellite, or dtype."""
+        res = self._current_resolution()
+        info = self._info
+        dtype = info.dtype_per_resolution.get(res, "")
+
+        # Try metadata valid_range (first band with data wins)
+        bands = info.bands_per_resolution.get(res, ())
+        for band in bands[:3]:
+            vr = info.valid_range_per_band.get(band)
+            if vr:
+                self._stretch_min.setValue(vr[0])
+                # Use 30% of max for reflectance-like display range
+                sf = info.scale_per_band.get(band)
+                if sf and sf > 1:
+                    self._stretch_max.setValue(vr[1] * 0.3)
+                else:
+                    self._stretch_max.setValue(vr[1])
+                return
+
+        # Try satellite+dtype defaults, then dtype defaults
+        from .geozarr_provider import _STRETCH_DEFAULTS, _DTYPE_DEFAULTS
+        lo, hi = None, None
+        if self._satellite and dtype:
+            lo, hi = _STRETCH_DEFAULTS.get((self._satellite, dtype), (None, None))
+        if lo is None and dtype:
+            lo, hi = _DTYPE_DEFAULTS.get(dtype, (None, None))
+        if lo is not None:
+            self._stretch_min.setValue(lo)
+            self._stretch_max.setValue(hi)
+            return
+
+        # No info - leave at 0/1
+        self._stretch_min.setValue(0.0)
+        self._stretch_max.setValue(1.0)
+
+    def stretch_range(self) -> Optional[Tuple[float, float]]:
+        """Return user-set (min, max) stretch range."""
+        lo = self._stretch_min.value()
+        hi = self._stretch_max.value()
+        if hi > lo:
+            return (lo, hi)
+        return None
 
     def _build_footer(self, layout, zarr_url):
         """Layer name field + OK/Cancel buttons."""
@@ -209,13 +302,13 @@ class GeoZarrLoadDialog(QDialog):
         name_layout.addWidget(self._name_edit)
         layout.addLayout(name_layout)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
     @staticmethod
-    def _build_info_lines(info: ZarrRootInfo) -> list:
+    def _build_info_lines(info: ZarrRootInfo, stac_props: dict = None) -> list:
         """Build compact info strings for the dataset header."""
         parts = []
         if info.epsg:
@@ -237,6 +330,22 @@ class GeoZarrLoadDialog(QDialog):
         parts.append(f"{len(info.resolutions)} res, {total_bands} bands")
         if info.conventions:
             parts.append(", ".join(info.conventions))
+        # STAC quality properties
+        if stac_props:
+            cc = stac_props.get("eo:cloud_cover")
+            if cc is not None:
+                parts.append(f"Cloud: {cc:.0f}%")
+            proc = stac_props.get("processing:level") or stac_props.get(
+                "processing_level"
+            )
+            if proc:
+                parts.append(proc)
+            sun_el = stac_props.get("view:sun_elevation")
+            if sun_el is not None:
+                parts.append(f"Sun el: {sun_el:.0f}\u00b0")
+            orbit = stac_props.get("sat:orbit_state")
+            if orbit:
+                parts.append(orbit.capitalize())
         return parts
 
     def _resolution_label(self, res: str) -> str:
@@ -261,9 +370,15 @@ class GeoZarrLoadDialog(QDialog):
             self._info, resolution, self._band_layout,
             self._band_checks, self._satellite, self._preset_buttons,
         )
+        # Record default preset order so selected_bands() returns R,G,B
+        if self._satellite:
+            default = band_presets.default_preset(self._satellite)
+            if default:
+                self._last_preset_bands = default
 
     def _on_resolution_changed(self, _index: int) -> None:
         self._populate_bands(self._current_resolution())
+        self._update_stretch_defaults()
 
     def _apply_preset(self, preset_name: str) -> None:
         presets = band_presets.get_presets(self._satellite)
@@ -271,6 +386,7 @@ class GeoZarrLoadDialog(QDialog):
             return
         bands = presets.get(preset_name)
         if bands:
+            self._last_preset_bands = bands  # preserve R,G,B order
             self._select_bands(bands)
 
     def _select_bands(self, bands: tuple) -> None:
@@ -298,11 +414,21 @@ class GeoZarrLoadDialog(QDialog):
         return self._current_resolution()
 
     def selected_bands(self) -> List[str]:
-        return [
+        checked = [
             cb.property("band_id")
             for cb in self._band_checks.values()
             if cb.isChecked()
         ]
+        # If a preset was applied and selection still matches, preserve
+        # preset order (e.g. B04,B03,B02 for True Color = R,G,B).
+        # Use original metadata case (server paths may be case-sensitive).
+        if self._last_preset_bands:
+            preset_set = {b.upper() for b in self._last_preset_bands}
+            checked_set = {b.upper() for b in checked}
+            if preset_set == checked_set:
+                upper_to_actual = {b.upper(): b for b in checked}
+                return [upper_to_actual[b.upper()] for b in self._last_preset_bands]
+        return checked
 
     def layer_name(self) -> str:
         return self._name_edit.text() or "GeoZarr"

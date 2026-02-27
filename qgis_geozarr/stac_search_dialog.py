@@ -184,7 +184,7 @@ class StacSearchDialog(QDialog):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(self._band_widget)
-        scroll.setFrameShape(scroll.NoFrame)
+        scroll.setFrameShape(scroll.Shape.NoFrame)
         scroll.setMinimumHeight(120)
         band_group_layout.addWidget(scroll, stretch=1)
 
@@ -199,10 +199,10 @@ class StacSearchDialog(QDialog):
         name_row.addWidget(self._name_edit)
         layout.addLayout(name_row)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        self._ok_btn = buttons.button(QDialogButtonBox.Ok)
+        self._ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
         self._ok_btn.setText("Load")
         self._ok_btn.setEnabled(False)
         layout.addWidget(buttons)
@@ -233,11 +233,16 @@ class StacSearchDialog(QDialog):
         self._info = info
         self._items = items
 
-        # Date range summary
+        # Date range + cloud cover summary
         dates = sorted(it["datetime"][:10] for it in items)
         first = dates[0] if dates else ""
         last = dates[-1] if dates else ""
-        self._results_label.setText(f"Found {len(items)} items ({first} to {last})")
+        summary = f"Found {len(items)} items ({first} to {last})"
+        cc_values = [it["cloud_cover"] for it in items if "cloud_cover" in it]
+        if cc_values:
+            avg_cc = sum(cc_values) / len(cc_values)
+            summary += f", avg {avg_cc:.0f}% cloud"
+        self._results_label.setText(summary)
 
         # Populate bands
         if info and info.resolutions:

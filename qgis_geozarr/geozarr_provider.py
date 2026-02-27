@@ -23,16 +23,17 @@ from qgis.core import (
     QgsInterval,
     QgsMessageLog,
     QgsMultiBandColorRenderer,
+    QgsPalettedRasterRenderer,
     QgsProject,
     QgsRasterLayer,
-    QgsRasterMinMaxOrigin,
+    QgsRectangle,
     QgsSingleBandGrayRenderer,
     QgsStacConnection,
     QgsTemporalNavigationObject,
 )
 from qgis.gui import QgsDataItemGuiProvider
 from qgis.PyQt.QtCore import Qt, QThread, pyqtSignal
-from qgis.PyQt.QtWidgets import QAction, QApplication, QMessageBox
+from qgis.PyQt.QtWidgets import QAction, QApplication, QDialog, QMessageBox
 
 from . import geozarr_metadata
 from .geozarr_dialog import GeoZarrLoadDialog
@@ -79,12 +80,25 @@ def _clean_gdal_uri(raw: str) -> str:
     return raw
 
 
+_stac_cache: dict = {}  # URL -> parsed JSON, capped at _STAC_CACHE_MAX
+_stac_cache_lock = threading.Lock()
+_STAC_CACHE_MAX = 50
+
+
 def _fetch_stac_item_json(stac_item_url: str) -> dict:
-    """Fetch a STAC item JSON. Returns empty dict on failure."""
+    """Fetch a STAC item JSON with caching. Returns empty dict on failure."""
+    with _stac_cache_lock:
+        if stac_item_url in _stac_cache:
+            return _stac_cache[stac_item_url]
     try:
         data = geozarr_metadata._vsi_read(stac_item_url)
         if data:
-            return json.loads(data)
+            result = json.loads(data)
+            with _stac_cache_lock:
+                if len(_stac_cache) >= _STAC_CACHE_MAX:
+                    _stac_cache.pop(next(iter(_stac_cache)), None)
+                _stac_cache[stac_item_url] = result
+            return result
     except (json.JSONDecodeError, OSError) as e:
         log.debug("STAC item fetch failed: %s", stac_item_url, exc_info=True)
         QgsMessageLog.logMessage(
@@ -113,10 +127,27 @@ def _fetch_zarr_href(stac_item_url: str) -> tuple:
     return _extract_zarr_href(item.get("assets", {}))
 
 
+def _extract_thumbnail_url(item_json: dict) -> str:
+    """Find thumbnail or overview asset href from a STAC item."""
+    assets = item_json.get("assets", {})
+    for key in ("thumbnail", "overview", "rendered_preview"):
+        asset = assets.get(key, {})
+        href = asset.get("href", "")
+        if href:
+            return href
+    return ""
+
+
 class _ProviderFetchThread(QThread):
-    """Background thread for STAC resolve + zarr.json fetch."""
+    """Background thread for STAC resolve + zarr.json fetch.
+
+    After emitting ``finished``, pre-warms ALL ZARR: band sources in
+    parallel so the global vsicurl cache (``CPL_VSIL_CURL_CACHE_SIZE``)
+    has every array's zarr.json ready when the VRT opens later.
+    """
 
     finished = pyqtSignal(object, str)  # (ZarrRootInfo | None, zarr_url)
+    thumbnail_ready = pyqtSignal(bytes)  # emitted after finished, non-blocking
 
     def __init__(self, zarr_url: str, stac_api_url: str = ""):
         super().__init__()
@@ -124,14 +155,83 @@ class _ProviderFetchThread(QThread):
         self.stac_api_url = stac_api_url
 
     def run(self):
+        import time as _time
+
+        t0 = _time.monotonic()
         zarr_url = self.zarr_url
+        thumb_url = ""
         if self.stac_api_url:
-            zarr_url, _ = _fetch_zarr_href(self.stac_api_url)
+            item = _fetch_stac_item_json(self.stac_api_url)
+            t_stac = _time.monotonic()
+            log.debug("STAC item fetch: %.2fs", t_stac - t0)
+            if not item:
+                self.finished.emit(None, "")
+                return
+            zarr_url, _ = _extract_zarr_href(item.get("assets", {}))
             if not zarr_url:
                 self.finished.emit(None, "")
                 return
+            thumb_url = _extract_thumbnail_url(item)
+
+        t_pre_meta = _time.monotonic()
         info, url = geozarr_metadata.fetch_resolved(zarr_url)
+        t_meta = _time.monotonic()
+        log.debug("Metadata fetch: %.2fs", t_meta - t_pre_meta)
+
+        # Emit metadata immediately - dialog shows while we pre-warm
         self.finished.emit(info, url)
+
+        # Thumbnail first (fast single HTTP GET, ~0.5s) - arrives while
+        # dialog is still open. Pre-warm runs after.
+        if thumb_url:
+            data = geozarr_metadata._http_read(thumb_url)
+            if data:
+                self.thumbnail_ready.emit(data)
+
+        # Pre-warm default resolution band sources in parallel while dialog
+        # is shown. gdal.Open() caches zarr.json in the global vsicurl LRU.
+        if info:
+            self._prewarm_sources(info, url)
+            log.debug("Pre-warm done: %.2fs", _time.monotonic() - t_meta)
+
+        log.debug("Total fetch thread: %.2fs", _time.monotonic() - t0)
+
+    @staticmethod
+    def _prewarm_sources(info, url):
+        """Pre-open default resolution band sources and their overview counterparts.
+
+        gdal.Open() populates the vsicurl cache so subsequent VRT opens are
+        near-instant. Only warms the default resolution and coarser levels
+        where the same bands exist.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        default_res = info.resolutions[0] if info.resolutions else ""
+        if not default_res:
+            return
+        bands = info.bands_per_resolution.get(default_res, ())
+        if not bands:
+            return
+
+        # Default resolution bands first
+        uris = [_band_uri(url, default_res, b) for b in bands]
+        # Overview sources for those bands (coarser resolutions)
+        for res in info.resolutions[1:]:
+            avail = {b.upper() for b in info.bands_per_resolution.get(res, ())}
+            for b in bands:
+                if b.upper() in avail:
+                    uris.append(_band_uri(url, res, b))
+
+        def _warm(uri):
+            try:
+                ds = gdal.Open(uri)
+                del ds
+            except Exception:
+                pass
+
+        workers = min(len(uris), 8)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(_warm, uris))
 
 
 _TILE_RE = re.compile(r"_T(\d{2}[A-Z]{3})_")
@@ -189,12 +289,17 @@ def _query_stac_items(
             continue
         if grid_code and _extract_grid_code(feat) != grid_code:
             continue
-        dt = feat.get("properties", {}).get("datetime")
+        props = feat.get("properties", {})
+        dt = props.get("datetime")
         href, _ = _extract_zarr_href(feat.get("assets", {}))
         if dt and href:
-            items.append({
+            item = {
                 "datetime": dt, "zarr_url": href, "id": feat.get("id", ""),
-            })
+            }
+            cc = props.get("eo:cloud_cover")
+            if cc is not None:
+                item["cloud_cover"] = cc
+            items.append(item)
     items.sort(key=lambda x: x["datetime"])
     return items[:limit]
 
@@ -278,6 +383,34 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
             ts_action = QAction("Load time series...", menu)
             ts_action.triggered.connect(lambda: self._load_timeseries(item))
             menu.addAction(ts_action)
+            # Speculative prefetch: start STAC + zarr.json fetch NOW while
+            # user reads the context menu. Caches populate before click.
+            stac_api_url = self._build_stac_api_url(item)
+            if stac_api_url:
+                self._speculative_prefetch(stac_api_url)
+
+    @staticmethod
+    def _speculative_prefetch(stac_api_url: str) -> None:
+        """Fire-and-forget: fetch STAC item + zarr.json into cache.
+
+        Runs during context menu display so data is cached before the user
+        clicks 'Load GeoZarr...'. Both _stac_cache and geozarr_metadata._cache
+        are thread-safe.
+        """
+        with _stac_cache_lock:
+            if stac_api_url in _stac_cache:
+                return
+
+        def _fetch():
+            item = _fetch_stac_item_json(stac_api_url)
+            if not item:
+                return
+            href, _ = _extract_zarr_href(item.get("assets", {}))
+            if href:
+                geozarr_metadata.fetch_resolved(href)
+
+        t = threading.Thread(target=_fetch, daemon=True)
+        t.start()
 
     def _msg(self, text: str, level=Qgis.Info, duration: int = 0) -> None:
         """Push a message to the QGIS message bar if iface available."""
@@ -432,10 +565,11 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
         self._pending = {
             "item_name": item_name,
             "collection_id": self._extract_collection_id(item),
+            "stac_api_url": stac_api_url,
         }
 
         self._msg("Fetching metadata...")
-        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
         # Disconnect old thread to prevent double-click race
         self._disconnect_thread(self._fetch_thread)
@@ -454,27 +588,51 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
         item_name = self._pending.get("item_name", "")
         collection_id = self._pending.get("collection_id", "")
 
+        # Extract STAC properties for QA display
+        stac_props = {}
+        stac_url = self._pending.get("stac_api_url", "")
+        if stac_url:
+            item_json = _stac_cache.get(stac_url, {})
+            stac_props = item_json.get("properties", {})
+
         dlg = GeoZarrLoadDialog(
             info,
             parent=None,
             collection_id=collection_id,
             zarr_url=zarr_url,
             item_name=item_name,
+            stac_properties=stac_props,
         )
-        if dlg.exec_() != dlg.Accepted:
+        # Thumbnail arrives async - connect signal to dialog update
+        if self._fetch_thread:
+            self._fetch_thread.thumbnail_ready.connect(dlg.set_thumbnail)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
+
+        # Wait for pre-warm to finish (runs after finished.emit in thread).
+        # With smart pre-warm (~12 URIs, no ReadRaster) this typically
+        # completes within dialog interaction time.
+        if self._fetch_thread and self._fetch_thread.isRunning():
+            self._fetch_thread.wait(8000)
 
         bands = dlg.selected_bands()
         if not bands:
             QMessageBox.warning(None, TAG, "No bands selected.")
             return
 
-        self._msg("Building VRT and loading...")
-        QApplication.setOverrideCursor(Qt.WaitCursor)
+        from . import band_presets
+        satellite = band_presets.detect_satellite(collection_id) if collection_id else ""
+
+        stretch = dlg.stretch_range()
+
+        self._msg("Loading...")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()  # flush UI before blocking GDALOpenEx
         try:
             _create_layer(
                 zarr_url, bands, dlg.selected_resolution(),
-                dlg.layer_name(), info,
+                dlg.layer_name(), info, satellite=satellite or "",
+                stretch_range=stretch,
             )
         finally:
             QApplication.restoreOverrideCursor()
@@ -563,7 +721,7 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
 
         dlg.set_search_callback(on_search)
 
-        if dlg.exec_() != dlg.Accepted:
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
         # Build VRT and create layer
@@ -577,7 +735,7 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
             return
 
         self._msg("Building temporal VRT...")
-        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             vrt_path = _build_temporal_vrt(items, band, resolution, info)
             if not vrt_path:
@@ -694,89 +852,18 @@ def _untrack_and_remove(path: str) -> None:
         pass
 
 
-def _build_overview_vrt(zarr_url, bands, resolution, info) -> str:
-    """Build a VRT for one overview level. Returns temp file path."""
-    band_uris = [_band_uri(zarr_url, resolution, b) for b in bands]
-
-    vrt_file = tempfile.NamedTemporaryFile(
-        suffix=".vrt",
-        prefix=f"geozarr_ovr_{resolution}_",
-        delete=False,
-    )
-    vrt_path = _track_temp(vrt_file.name)
-    vrt_file.close()
-
-    try:
-        vrt_opts = gdal.BuildVRTOptions(separate=True)
-        vrt_ds = gdal.BuildVRT(vrt_path, band_uris, options=vrt_opts)
-        if vrt_ds is None:
-            return ""
-
-        gt = info.transform_per_resolution.get(resolution)
-        if gt:
-            vrt_ds.SetGeoTransform(gt)
-        elif info.geotransform and info.shape_per_resolution.get(resolution):
-            base_gt = info.geotransform
-            ovr_shape = info.shape_per_resolution[resolution]
-            base_shape = max(
-                info.shape_per_resolution.values(), key=lambda s: s[0] * s[1]
-            )
-            if base_shape[0] > 0 and base_shape[1] > 0:
-                sx = (base_gt[1] * base_shape[1]) / ovr_shape[1]
-                sy = (base_gt[5] * base_shape[0]) / ovr_shape[0]
-                vrt_ds.SetGeoTransform(
-                    (base_gt[0], sx, base_gt[2], base_gt[3], base_gt[4], sy)
-                )
-
-        if info.epsg:
-            srs = osr.SpatialReference()
-            srs.ImportFromEPSG(info.epsg)
-            vrt_ds.SetProjection(srs.ExportToWkt())
-
-        vrt_ds.FlushCache()
-        vrt_ds = None
-        return vrt_path
-    except Exception:
-        _untrack_and_remove(vrt_path)
-        raise
-
-
-def _inject_overviews(base_vrt_path, ovr_vrt_paths, bands, ovr_bands) -> None:
-    """Insert <Overview> elements into base VRT XML."""
-    tree = ET.parse(base_vrt_path)
-    root = tree.getroot()
-
-    for band_elem in root.findall("VRTRasterBand"):
-        band_idx = int(band_elem.get("band", "0")) - 1
-        if band_idx < 0 or band_idx >= len(bands):
-            continue
-        band_name = bands[band_idx]
-
-        for ovr_path, ovr_band_list in zip(ovr_vrt_paths, ovr_bands):
-            if not ovr_path:
-                continue
-            try:
-                ovr_idx = [b.upper() for b in ovr_band_list].index(
-                    band_name.upper()
-                )
-            except ValueError:
-                continue
-            ovr = ET.SubElement(band_elem, "Overview")
-            sf = ET.SubElement(ovr, "SourceFilename")
-            sf.set("relativeToVRT", "1")
-            sf.text = os.path.basename(ovr_path)
-            sb = ET.SubElement(ovr, "SourceBand")
-            sb.text = str(ovr_idx + 1)
-
-    tree.write(base_vrt_path, xml_declaration=True, encoding="utf-8")
-
-
-def _create_layer(zarr_url, bands, resolution, layer_name, info) -> None:
+def _create_layer(
+    zarr_url, bands, resolution, layer_name, info, satellite: str = "",
+    stretch_range=None,
+) -> None:
     """Create a QgsRasterLayer from selected bands."""
     if len(bands) == 1 and not _overview_resolutions(resolution, bands, info):
         _create_single_band_layer(zarr_url, bands[0], resolution, layer_name, info)
     else:
-        _create_multiband_vrt_layer(zarr_url, bands, resolution, layer_name, info)
+        _create_multiband_vrt_layer(
+            zarr_url, bands, resolution, layer_name, info, satellite,
+            stretch_range=stretch_range,
+        )
 
 
 def _create_single_band_layer(zarr_url, band, resolution, layer_name, info) -> None:
@@ -790,97 +877,225 @@ def _create_single_band_layer(zarr_url, band, resolution, layer_name, info) -> N
         return
     if info.epsg and not layer.crs().isValid():
         layer.setCrs(QgsCoordinateReferenceSystem(f"EPSG:{info.epsg}"))
+    _auto_style_single(layer)
     QgsProject.instance().addMapLayer(layer)
 
 
-def _create_multiband_vrt_layer(zarr_url, bands, resolution, layer_name, info) -> None:
-    """Build multi-band VRT with optional multiscale overviews."""
-    band_uris = [_band_uri(zarr_url, resolution, b) for b in bands]
+def _auto_style_single(layer: QgsRasterLayer) -> None:
+    """Auto-style single-band: classified colormap for discrete data, gray for continuous."""
+    dp = layer.dataProvider()
+    dt = dp.dataType(1)
+    # Only attempt classified styling for integer types
+    int_types = {Qgis.DataType.Byte, Qgis.DataType.Int16, Qgis.DataType.UInt16,
+                 Qgis.DataType.Int32, Qgis.DataType.UInt32}
+    if dt not in int_types:
+        return
+    classes = QgsPalettedRasterRenderer.classDataFromRaster(
+        dp, 1, ramp=None, feedback=None,
+    )
+    if not classes or len(classes) > 20:
+        return  # too many values = continuous data, use default gray
+    renderer = QgsPalettedRasterRenderer(dp, 1, classes)
+    layer.setRenderer(renderer)
+
+
+def _build_multiband_vrt_xml(zarr_url, bands, resolution, info, satellite="") -> str:
+    """Build multi-band VRT XML with overview references. Zero HTTP calls.
+
+    Uses metadata from ZarrRootInfo instead of gdal.BuildVRT() which would
+    open every remote source to read dimensions. Returns temp file path.
+
+    Overview references point to coarser-resolution bands, pre-warmed in
+    _ProviderFetchThread so they open from the vsicurl cache.
+    """
+    shape = info.shape_per_resolution.get(resolution, (0, 0))
+    ny, nx = shape
+    if ny == 0 or nx == 0:
+        return ""
+
+    gt = info.transform_per_resolution.get(resolution) or info.geotransform
+    dtype = info.dtype_per_resolution.get(resolution, "Float32")
+
+    root = ET.Element("VRTDataset", rasterXSize=str(nx), rasterYSize=str(ny))
+
+    if info.epsg:
+        srs_el = ET.SubElement(root, "SRS")
+        srs_obj = osr.SpatialReference()
+        srs_obj.ImportFromEPSG(info.epsg)
+        srs_el.text = srs_obj.ExportToWkt()
+
+    if gt:
+        gt_el = ET.SubElement(root, "GeoTransform")
+        gt_el.text = ", ".join(str(v) for v in gt)
+
+    from . import band_presets as _bp
+
+    for i, band_name in enumerate(bands, 1):
+        band_el = ET.SubElement(
+            root, "VRTRasterBand", dataType=dtype, band=str(i),
+        )
+        desc = _bp.get_band_label(satellite, band_name) if satellite else band_name
+        ET.SubElement(band_el, "Description").text = desc
+        uri = _band_uri(zarr_url, resolution, band_name)
+        src = ET.SubElement(band_el, "SimpleSource")
+        ET.SubElement(src, "SourceFilename", relativeToVRT="0").text = uri
+        ET.SubElement(src, "SourceBand").text = "1"
+        ET.SubElement(
+            src, "SrcRect",
+            xOff="0", yOff="0", xSize=str(nx), ySize=str(ny),
+        )
+        ET.SubElement(
+            src, "DstRect",
+            xOff="0", yOff="0", xSize=str(nx), ySize=str(ny),
+        )
+
+    # Add overview references to coarser resolutions (pre-warmed in cache)
+    ovr_levels = _overview_resolutions(resolution, bands, info)
+    for ovr_res, ovr_bands in ovr_levels:
+        ovr_shape = info.shape_per_resolution.get(ovr_res, (0, 0))
+        ony, onx = ovr_shape
+        if ony == 0:
+            continue
+        ovr_set = {b.upper() for b in ovr_bands}
+        for i, band_name in enumerate(bands):
+            if band_name.upper() not in ovr_set:
+                continue
+            band_el = root.findall("VRTRasterBand")[i]
+            ovr = ET.SubElement(band_el, "Overview")
+            ovr_uri = _band_uri(zarr_url, ovr_res, band_name)
+            ET.SubElement(ovr, "SourceFilename", relativeToVRT="0").text = ovr_uri
+            ET.SubElement(ovr, "SourceBand").text = "1"
 
     vrt_file = tempfile.NamedTemporaryFile(
         suffix=".vrt", prefix="geozarr_", delete=False,
     )
-    vrt_path = _track_temp(vrt_file.name)
+    path = _track_temp(vrt_file.name)
     vrt_file.close()
-
     try:
-        vrt_opts = gdal.BuildVRTOptions(separate=True)
-        vrt_ds = gdal.BuildVRT(vrt_path, band_uris, options=vrt_opts)
-
-        if vrt_ds is None:
-            QMessageBox.warning(
-                None, TAG, f"Failed to build VRT:\n{gdal.GetLastErrorMsg()}",
-            )
-            _untrack_and_remove(vrt_path)
-            return
-
-        if info.epsg:
-            srs = osr.SpatialReference()
-            srs.ImportFromEPSG(info.epsg)
-            vrt_ds.SetProjection(srs.ExportToWkt())
-        if info.geotransform:
-            vrt_ds.SetGeoTransform(info.geotransform)
-
-        vrt_ds.FlushCache()
-        vrt_ds = None
+        ET.ElementTree(root).write(path, xml_declaration=True, encoding="utf-8")
     except Exception:
-        _untrack_and_remove(vrt_path)
+        _untrack_and_remove(path)
         raise
+    return path
 
-    # Add multiscale overviews
-    ovr_levels = _overview_resolutions(resolution, bands, info)
-    if ovr_levels:
-        ovr_paths = []
-        ovr_band_lists = []
-        for ovr_res, ovr_bands_at_level in ovr_levels:
-            ovr_path = _build_overview_vrt(
-                zarr_url, ovr_bands_at_level, ovr_res, info,
-            )
-            ovr_paths.append(ovr_path)
-            ovr_band_lists.append(ovr_bands_at_level)
-        _inject_overviews(vrt_path, ovr_paths, bands, ovr_band_lists)
+
+def _create_multiband_vrt_layer(
+    zarr_url, bands, resolution, layer_name, info, satellite: str = "",
+    stretch_range=None,
+) -> None:
+    """Build multi-band VRT with optional multiscale overviews."""
+    import time as _time
+
+    t0 = _time.monotonic()
+    vrt_path = _build_multiband_vrt_xml(zarr_url, bands, resolution, info, satellite)
+    t_vrt = _time.monotonic()
+    log.debug("VRT build: %.3fs", t_vrt - t0)
+
+    if not vrt_path:
+        QMessageBox.warning(
+            None, TAG,
+            "Failed to build VRT: missing shape metadata for "
+            f"resolution {resolution}.",
+        )
+        return
 
     layer = QgsRasterLayer(vrt_path, layer_name, "gdal")
+    t_open = _time.monotonic()
+    log.debug("Layer open: %.3fs", t_open - t_vrt)
+
     if not layer.isValid():
         QMessageBox.warning(
             None, TAG, f"Failed to load VRT:\n{layer.error().message()}",
         )
         return
 
+    dtype = info.dtype_per_resolution.get(resolution, "")
+    _auto_style(layer, len(bands), dtype=dtype, satellite=satellite,
+                stretch_range=stretch_range)
+    t_style = _time.monotonic()
+    log.debug("Auto-style: %.3fs", t_style - t_open)
+
     QgsProject.instance().addMapLayer(layer)
-    _auto_style(layer, len(bands))
+    t_add = _time.monotonic()
+    log.debug("Add to project: %.3fs (total post-dialog: %.2fs)",
+              t_add - t_style, t_add - t0)
     QgsMessageLog.logMessage(
-        f"Loaded: {layer_name} ({len(bands)} bands, {resolution})",
+        f"Loaded: {layer_name} ({len(bands)} bands, {resolution}) "
+        f"in {t_add - t0:.1f}s",
         TAG, Qgis.Info,
     )
 
 
-def _auto_style(layer: QgsRasterLayer, band_count: int) -> None:
-    """Apply RGB rendering with cumulative cut stretch for 3-band composites."""
+_STRETCH_DEFAULTS = {
+    ("sentinel-2", "UInt16"): (0, 3000),
+    ("sentinel-2", "Float32"): (0.0, 0.4),  # BOA reflectance 0-1
+    ("sentinel-2", "Float64"): (0.0, 0.4),
+    ("sentinel-3", "UInt16"): (0, 3000),
+    ("sentinel-3", "Float32"): (0.0, 0.4),
+    ("landsat-8", "UInt16"): (0, 12000),
+    ("landsat-9", "UInt16"): (0, 12000),
+}
+_DTYPE_DEFAULTS = {
+    "UInt16": (0, 4000),
+    "Int16": (-1000, 4000),
+    "Float32": (0.0, 1.0),
+    "Float64": (0.0, 1.0),
+    "Byte": (0, 255),
+}
+
+
+def _auto_style(
+    layer: QgsRasterLayer, band_count: int,
+    dtype: str = "", satellite: str = "",
+    stretch_range=None,
+) -> None:
+    """Apply RGB stretch.
+
+    Priority: user override > satellite+dtype > dtype > cumulativeCut.
+    """
     if band_count != 3:
         return
     dp = layer.dataProvider()
     renderer = QgsMultiBandColorRenderer(dp, 1, 2, 3)
-    origin = QgsRasterMinMaxOrigin()
-    origin.setLimits(QgsRasterMinMaxOrigin.CumulativeCut)
-    origin.setCumulativeCutLower(0.02)
-    origin.setCumulativeCutUpper(0.98)
-    origin.setStatAccuracy(QgsRasterMinMaxOrigin.Estimated)
-    renderer.setMinMaxOrigin(origin)
+
+    # Priority 1: user override from dialog
+    lo, hi = None, None
+    if stretch_range:
+        lo, hi = stretch_range
+    # Priority 2: satellite+dtype defaults
+    if lo is None and satellite and dtype:
+        lo, hi = _STRETCH_DEFAULTS.get((satellite, dtype), (None, None))
+    # Priority 3: dtype defaults
+    if lo is None and dtype:
+        lo, hi = _DTYPE_DEFAULTS.get(dtype, (None, None))
+
+    # Fallback: cumulativeCut with small center extent
+    sample_extent = None
+    if lo is None:
+        ext = layer.extent()
+        cx, cy = ext.center().x(), ext.center().y()
+        w, h = ext.width() * 0.05, ext.height() * 0.05
+        sample_extent = QgsRectangle(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
 
     for band_idx, setter in (
         (1, renderer.setRedContrastEnhancement),
         (2, renderer.setGreenContrastEnhancement),
         (3, renderer.setBlueContrastEnhancement),
     ):
+        if lo is not None:
+            band_lo, band_hi = float(lo), float(hi)
+        else:
+            band_lo, band_hi = dp.cumulativeCut(
+                band_idx, 0.02, 0.98, sample_extent, 250,
+            )
         ce = QgsContrastEnhancement(dp.dataType(band_idx))
+        ce.setMinimumValue(band_lo)
+        ce.setMaximumValue(band_hi)
         ce.setContrastEnhancementAlgorithm(
-            QgsContrastEnhancement.StretchToMinimumMaximum,
+            QgsContrastEnhancement.ContrastEnhancementAlgorithm.StretchToMinimumMaximum,
         )
         setter(ce)
-
     layer.setRenderer(renderer)
-    layer.triggerRepaint()
 
 
 def _build_temporal_vrt(
@@ -912,10 +1127,12 @@ def _build_temporal_vrt(
         band_el = ET.SubElement(
             root, "VRTRasterBand", dataType=dtype, band=str(i),
         )
-        # Band name: date + item ID for identify tool / temporal controller
+        # Band name: date + cloud% + item ID for identify tool
         dt_label = item["datetime"][:10]
         item_id = item.get("id", "")
-        desc = f"{dt_label} {item_id}" if item_id else dt_label
+        cc = item.get("cloud_cover")
+        cc_str = f" ({cc:.0f}%)" if cc is not None else ""
+        desc = f"{dt_label}{cc_str} {item_id}" if item_id else f"{dt_label}{cc_str}"
         ET.SubElement(band_el, "Description").text = desc
         src = ET.SubElement(band_el, "SimpleSource")
         ET.SubElement(src, "SourceFilename", relativeToVRT="0").text = uri
@@ -960,7 +1177,7 @@ def _create_temporal_layer(
     renderer = QgsSingleBandGrayRenderer(layer.dataProvider(), 1)
     ce = QgsContrastEnhancement(layer.dataProvider().dataType(1))
     ce.setContrastEnhancementAlgorithm(
-        QgsContrastEnhancement.StretchToMinimumMaximum,
+        QgsContrastEnhancement.ContrastEnhancementAlgorithm.StretchToMinimumMaximum,
     )
     renderer.setContrastEnhancement(ce)
     layer.setRenderer(renderer)
@@ -1014,8 +1231,14 @@ def _activate_temporal_controller(iface, dts) -> None:
         ctrl.setFrameDuration(
             QgsInterval(max(median_days, 1), Qgis.TemporalUnit.Days),
         )
-        ctrl.setNavigationMode(
-            QgsTemporalNavigationObject.NavigationMode.Animated,
-        )
+        # Enum path varies across QGIS versions
+        try:
+            animated = QgsTemporalNavigationObject.NavigationMode.Animated
+        except AttributeError:
+            animated = QgsTemporalNavigationObject.Animated
+        ctrl.setNavigationMode(animated)
+        ctrl.setCurrentFrameNumber(0)
     except Exception as e:
-        log.debug("Temporal controller setup failed: %s", e, exc_info=True)
+        QgsMessageLog.logMessage(
+            f"Temporal controller setup failed: {e}", TAG, Qgis.Warning,
+        )

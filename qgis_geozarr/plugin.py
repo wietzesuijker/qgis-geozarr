@@ -122,7 +122,7 @@ class GeoZarrPlugin:
     def _load_from_url(self) -> None:
         """Standalone entry: paste a Zarr URL to load."""
         dlg = _UrlDialog(self._iface.mainWindow())
-        if dlg.exec_() != QDialog.Accepted:
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
         url = dlg.url().strip()
@@ -131,7 +131,7 @@ class GeoZarrPlugin:
 
         _save_recent_url(url)
 
-        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         self._iface.messageBar().pushMessage(
             "GeoZarr", "Fetching metadata...", Qgis.Info, 0
         )
@@ -176,7 +176,7 @@ class GeoZarrPlugin:
             parent=self._iface.mainWindow(),
             zarr_url=url,
         )
-        if band_dlg.exec_() != band_dlg.Accepted:
+        if band_dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
         bands = band_dlg.selected_bands()
@@ -186,7 +186,7 @@ class GeoZarrPlugin:
         if not bands:
             return
 
-        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         self._iface.messageBar().pushMessage(
             "GeoZarr", "Building VRT and loading...", Qgis.Info, 0
         )
@@ -233,7 +233,7 @@ class _UrlDialog(QDialog):
         url_row = QHBoxLayout()
         self._combo = QComboBox()
         self._combo.setEditable(True)
-        self._combo.setInsertPolicy(QComboBox.NoInsert)
+        self._combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self._combo.setSizePolicy(
             self._combo.sizePolicy().horizontalPolicy(),
             self._combo.sizePolicy().verticalPolicy(),
@@ -259,10 +259,10 @@ class _UrlDialog(QDialog):
         layout.addWidget(self._hint)
         self._combo.editTextChanged.connect(self._validate)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        self._ok_btn = buttons.button(QDialogButtonBox.Ok)
+        self._ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
         self._ok_btn.setEnabled(False)
         layout.addWidget(buttons)
 
