@@ -141,9 +141,9 @@ def _extract_thumbnail_url(item_json: dict) -> str:
 class _ProviderFetchThread(QThread):
     """Background thread for STAC resolve + zarr.json fetch.
 
-    After emitting ``finished``, pre-warms ALL ZARR: band sources in
-    parallel so the global vsicurl cache (``CPL_VSIL_CURL_CACHE_SIZE``)
-    has every array's zarr.json ready when the VRT opens later.
+    After emitting ``finished``, pre-warms default-resolution band sources
+    and coarser overview levels so the vsicurl cache has each array's
+    zarr.json ready when the VRT opens later.
     """
 
     finished = pyqtSignal(object, str)  # (ZarrRootInfo | None, zarr_url)
