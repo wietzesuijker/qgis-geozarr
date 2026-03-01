@@ -25,6 +25,7 @@ about=Right-click any Zarr asset in the QGIS STAC browser and load exactly the b
 
 changelog=
     0.1.3 - Streamline for first public release
+    - Persistent metadata cache with conditional GET (ETag/Last-Modified)
     - Remove time series (parked in feat/time-series-rgb for future iteration)
     - Clean up metadata, docs, and test suite
     0.1.2 - Thread safety, UX polish
