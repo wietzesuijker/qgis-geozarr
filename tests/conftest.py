@@ -169,23 +169,3 @@ def sample_v3_subgroup_crs():
     }
 
 
-@pytest.fixture
-def sample_zarr_root_info():
-    """Pre-built ZarrRootInfo for provider tests."""
-    return ZarrRootInfo(
-        resolutions=("r10m", "r20m"),
-        bands_per_resolution={
-            "r10m": ("b02", "b03", "b04", "b08"),
-            "r20m": ("b05", "b06", "b8a"),
-        },
-        shape_per_resolution={
-            "r10m": (10980, 10980),
-            "r20m": (5490, 5490),
-        },
-        transform_per_resolution={},
-        dtype_per_resolution={"r10m": "UInt16", "r20m": "UInt16"},
-        epsg=32627,
-        geotransform=(399960.0, 10.0, 0.0, 4500000.0, 0.0, -10.0),
-        sub_group="measurements/reflectance",
-        band_descriptions={"b02": "Blue (490 nm)"},
-    )

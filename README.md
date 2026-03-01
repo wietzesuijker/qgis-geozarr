@@ -25,15 +25,12 @@ Open the QGIS Browser panel. Right-click "STAC" > New Connection and add a catal
 
 Browse to a Zarr asset, right-click > **Load GeoZarr...**. Pick bands, choose a resolution, hit Load.
 
-For time series: right-click > **Load time series...** to search by date range and animate.
-
 Or skip STAC entirely: click the GeoZarr toolbar icon and paste any Zarr store URL.
 
 ## Features
 
 - **Band and resolution picker** with satellite presets (Sentinel-2, Landsat 8/9, MODIS, Sentinel-3)
 - **Multiscale pyramids** from the multiscales convention - smooth zoom without extra downloads
-- **Time series** - search by date range, filter by grid tile, animate with the temporal controller
 - **Auto RGB styling** with stretch defaults tuned per satellite and data type
 - **Cloud-optimized** out of the box - HTTP/2, parallel decode, connection pooling, shard index caching
 - **URL loader** with recent history and clipboard paste
@@ -46,7 +43,7 @@ Or skip STAC entirely: click the GeoZarr toolbar icon and paste any Zarr store U
 ## Development
 
 ```bash
-make test    # 96 tests
+make test    # 78 tests
 make lint    # ruff check
 make zip     # build plugin zip
 ```

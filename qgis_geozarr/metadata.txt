@@ -3,7 +3,7 @@ name=GeoZarr
 qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
 description=Load cloud-native Zarr data from STAC: band selection, multiscale pyramids, satellite presets (Zarr v2 + v3)
-version=0.1.2
+version=0.1.3
 author=Wietze Suijker
 email=wietze.suijker@gmail.com
 icon=icon.svg
@@ -13,18 +13,20 @@ deprecated=False
 homepage=https://github.com/wietzesuijker/qgis-geozarr
 tracker=https://github.com/wietzesuijker/qgis-geozarr/issues
 repository=https://github.com/wietzesuijker/qgis-geozarr
-tags=geozarr,zarr,stac,sentinel-2,landsat,copernicus,cloud-native,raster,time-series,multiscale
+tags=geozarr,zarr,stac,sentinel-2,landsat,copernicus,cloud-native,raster,multiscale
 category=Raster
 hasProcessingProvider=no
 about=Right-click any Zarr asset in the QGIS STAC browser and load exactly the bands and resolution you need. Or paste a URL directly.
     - Band and resolution picker with satellite presets (Sentinel-2, Landsat, MODIS, Sentinel-3, including EOPF)
     - Multiscale pyramids from the multiscales convention - no extra downloads
-    - Time series: search by date range, filter by grid tile, animate with the temporal controller
     - Auto RGB styling with stretch defaults tuned per satellite and data type
     - Cloud-optimized out of the box (HTTP/2, parallel decode, connection pooling)
     Zarr v2 (.zmetadata) and v3 (zarr.json), including sharded stores. Requires QGIS 3.44+.
 
 changelog=
+    0.1.3 - Streamline for first public release
+    - Remove time series (parked in feat/time-series-rgb for future iteration)
+    - Clean up metadata, docs, and test suite
     0.1.2 - Thread safety, UX polish
     - Fix thumbnail race condition, thread cleanup on cancel, cache eviction
     - Cloud cover color badges, band counts in titles, file size estimates
@@ -33,11 +35,9 @@ changelog=
     0.1.1 - Pagination, flat Zarr, Landsat grid
     - STAC pagination up to 500 items
     - Flat Zarr stores (no resolution groups) load as single resolution
-    - Landsat WRS-2 grid filtering for same-tile time series
     0.1.0 - Initial release
     - Zarr v2 and v3 with automatic format detection
     - STAC browser integration: right-click to load, or paste a URL
-    - Time series search with grid/tile-aware filtering and temporal animation
     - Band/resolution picker with satellite presets
     - Multiscale convention support (VRT overviews from coarser resolutions)
     - Auto RGB styling with cumulative-cut stretch

@@ -38,7 +38,7 @@ def populate_band_checkboxes(
     auto_select: bool = True,
     on_change=None,
 ) -> None:
-    """Populate band checkboxes into a layout. Shared by load + time series dialogs."""
+    """Populate band checkboxes into a layout for the load dialog."""
     # Clear existing
     for cb in band_checks.values():
         band_layout.removeWidget(cb)
