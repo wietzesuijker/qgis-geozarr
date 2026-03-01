@@ -1,10 +1,19 @@
-"""Tests for geozarr_metadata parsing (v2 + v3)."""
+"""Tests for geozarr_metadata parsing (v2 + v3) and disk cache."""
+
+import json
+import os
+import time
 
 import pytest
 
 from qgis_geozarr.geozarr_metadata import (
+    ZarrRootInfo,
     _ZARR_TO_GDAL_DTYPE,
     _V2_DTYPE_MAP,
+    _disk_cache_evict,
+    _disk_cache_path,
+    _disk_cache_read,
+    _disk_cache_write,
     _parse,
     _parse_consolidated,
     _parse_crs,
@@ -363,3 +372,86 @@ class TestFlatZarrFallback:
         assert "temperature" in info.bands_per_resolution["default"]
         # 1D array should not be included (shape check: need >= 2D)
         assert "lat" not in info.bands_per_resolution.get("default", [])
+
+
+class TestZarrRootInfoSerialization:
+    """Test to_dict / from_dict round-trip."""
+
+    def test_round_trip(self):
+        info = ZarrRootInfo(
+            resolutions=("r10m", "r20m"),
+            bands_per_resolution={"r10m": ("b02", "b03"), "r20m": ("b05",)},
+            shape_per_resolution={"r10m": (10980, 10980), "r20m": (5490, 5490)},
+            transform_per_resolution={"r10m": (600000.0, 10.0, 0.0, 5000000.0, 0.0, -10.0)},
+            dtype_per_resolution={"r10m": "UInt16", "r20m": "UInt16"},
+            epsg=32632,
+            geotransform=(600000.0, 10.0, 0.0, 5000000.0, 0.0, -10.0),
+            conventions=("GeoZarr",),
+            sub_group="measurements/reflectance",
+            band_descriptions={"b02": "Blue"},
+            scale_per_band={"b02": 10000.0},
+            valid_range_per_band={"b02": (0.0, 10000.0)},
+        )
+        d = info.to_dict()
+        restored = ZarrRootInfo.from_dict(d)
+        assert restored.resolutions == info.resolutions
+        assert restored.bands_per_resolution == info.bands_per_resolution
+        assert restored.shape_per_resolution == info.shape_per_resolution
+        assert restored.transform_per_resolution == info.transform_per_resolution
+        assert restored.geotransform == info.geotransform
+        assert restored.epsg == info.epsg
+        assert restored.conventions == info.conventions
+        assert restored.valid_range_per_band == info.valid_range_per_band
+
+    def test_round_trip_minimal(self):
+        info = ZarrRootInfo(resolutions=(), bands_per_resolution={})
+        restored = ZarrRootInfo.from_dict(info.to_dict())
+        assert restored.resolutions == ()
+        assert restored.geotransform is None
+
+
+class TestDiskCache:
+    """Test persistent disk cache read/write/evict."""
+
+    def test_write_and_read(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("qgis_geozarr.geozarr_metadata._disk_cache_dir", lambda: str(tmp_path))
+        info = ZarrRootInfo(
+            resolutions=("r10m",),
+            bands_per_resolution={"r10m": ("b02",)},
+            epsg=32632,
+        )
+        url = "https://example.com/data.zarr"
+        _disk_cache_write(url, info, etag='"abc123"', last_modified="Mon, 01 Jan 2026 00:00:00 GMT")
+        result = _disk_cache_read(url)
+        assert result is not None
+        restored_info, etag, lm = result
+        assert restored_info.resolutions == ("r10m",)
+        assert restored_info.epsg == 32632
+        assert etag == '"abc123"'
+        assert lm == "Mon, 01 Jan 2026 00:00:00 GMT"
+
+    def test_read_miss(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("qgis_geozarr.geozarr_metadata._disk_cache_dir", lambda: str(tmp_path))
+        assert _disk_cache_read("https://nonexistent.example.com/z") is None
+
+    def test_evict_old_entries(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("qgis_geozarr.geozarr_metadata._disk_cache_dir", lambda: str(tmp_path))
+        # Write a cache file and backdate it
+        info = ZarrRootInfo(resolutions=(), bands_per_resolution={})
+        url = "https://old.example.com/z"
+        _disk_cache_write(url, info)
+        path = _disk_cache_path(url)
+        old_time = time.time() - 8 * 24 * 3600  # 8 days ago
+        os.utime(path, (old_time, old_time))
+        assert os.path.exists(path)
+        _disk_cache_evict()
+        assert not os.path.exists(path)
+
+    def test_evict_keeps_recent(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("qgis_geozarr.geozarr_metadata._disk_cache_dir", lambda: str(tmp_path))
+        info = ZarrRootInfo(resolutions=(), bands_per_resolution={})
+        url = "https://fresh.example.com/z"
+        _disk_cache_write(url, info)
+        path = _disk_cache_path(url)
+        _disk_cache_evict()
+        assert os.path.exists(path)
