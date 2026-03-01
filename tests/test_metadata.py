@@ -421,14 +421,13 @@ class TestDiskCache:
             epsg=32632,
         )
         url = "https://example.com/data.zarr"
-        _disk_cache_write(url, info, etag='"abc123"', last_modified="Mon, 01 Jan 2026 00:00:00 GMT")
+        _disk_cache_write(url, info)
         result = _disk_cache_read(url)
         assert result is not None
-        restored_info, etag, lm = result
+        restored_info, age = result
         assert restored_info.resolutions == ("r10m",)
         assert restored_info.epsg == 32632
-        assert etag == '"abc123"'
-        assert lm == "Mon, 01 Jan 2026 00:00:00 GMT"
+        assert age < 5  # just written, age should be near zero
 
     def test_read_miss(self, tmp_path, monkeypatch):
         monkeypatch.setattr("qgis_geozarr.geozarr_metadata._disk_cache_dir", lambda: str(tmp_path))

@@ -88,6 +88,10 @@ _stac_cache: OrderedDict = OrderedDict()  # URL -> parsed JSON, LRU eviction
 _stac_cache_lock = threading.Lock()
 _STAC_CACHE_MAX = 50
 
+# Inflight prefetch tracking: URL -> Event (set when prefetch completes)
+_inflight: dict = {}
+_inflight_lock = threading.Lock()
+
 
 def _fetch_stac_item_json(stac_item_url: str) -> dict:
     """Fetch a STAC item JSON with caching. Returns empty dict on failure."""
@@ -96,7 +100,7 @@ def _fetch_stac_item_json(stac_item_url: str) -> dict:
             _stac_cache.move_to_end(stac_item_url)
             return _stac_cache[stac_item_url]
     try:
-        data = geozarr_metadata._vsi_read(stac_item_url)
+        data = geozarr_metadata._http_read(stac_item_url)
         if data:
             result = json.loads(data)
             with _stac_cache_lock:
@@ -166,6 +170,15 @@ class _ProviderFetchThread(QThread):
         zarr_url = self.zarr_url
         thumb_url = ""
         if self.stac_api_url:
+            # Wait for inflight prefetch instead of starting a duplicate fetch
+            event = None
+            with _inflight_lock:
+                event = _inflight.get(self.stac_api_url)
+            if event:
+                log.debug("Waiting for inflight prefetch: %s", self.stac_api_url)
+                event.wait(timeout=30)
+                log.debug("Inflight prefetch done: %.2fs", _time.monotonic() - t0)
+            # Now read from cache (populated by prefetch or fresh fetch)
             item = _fetch_stac_item_json(self.stac_api_url)
             t_stac = _time.monotonic()
             log.debug("STAC item fetch: %.2fs", t_stac - t0)
@@ -189,9 +202,9 @@ class _ProviderFetchThread(QThread):
         # Thumbnail first (fast single HTTP GET, ~0.5s) - arrives while
         # dialog is still open. Pre-warm runs after.
         if thumb_url:
-            data = geozarr_metadata._http_read(thumb_url)
-            if data:
-                self.thumbnail_ready.emit(data)
+            thumb_data = geozarr_metadata._http_read(thumb_url)
+            if thumb_data:
+                self.thumbnail_ready.emit(thumb_data)
 
         # Pre-warm default resolution band sources in parallel while dialog
         # is shown. gdal.Open() caches zarr.json in the global vsicurl LRU.
@@ -273,20 +286,30 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
         """Fire-and-forget: fetch STAC item + zarr.json into cache.
 
         Runs during context menu display so data is cached before the user
-        clicks 'Load GeoZarr...'. Both _stac_cache and geozarr_metadata._cache
-        are thread-safe.
+        clicks 'Load GeoZarr...'. Tracked in _inflight so main fetch can
+        wait for it instead of starting a duplicate.
         """
         with _stac_cache_lock:
             if stac_api_url in _stac_cache:
                 return
+        with _inflight_lock:
+            if stac_api_url in _inflight:
+                return
+            event = threading.Event()
+            _inflight[stac_api_url] = event
 
         def _fetch():
-            item = _fetch_stac_item_json(stac_api_url)
-            if not item:
-                return
-            href, _ = _extract_zarr_href(item.get("assets", {}))
-            if href:
-                geozarr_metadata.fetch_resolved(href)
+            try:
+                item = _fetch_stac_item_json(stac_api_url)
+                if not item:
+                    return
+                href, _ = _extract_zarr_href(item.get("assets", {}))
+                if href:
+                    geozarr_metadata.fetch_resolved(href)
+            finally:
+                event.set()
+                with _inflight_lock:
+                    _inflight.pop(stac_api_url, None)
 
         t = threading.Thread(target=_fetch, daemon=True)
         t.start()

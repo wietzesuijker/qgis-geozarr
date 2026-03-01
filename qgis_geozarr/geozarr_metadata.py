@@ -98,7 +98,8 @@ class ZarrRootInfo:
 # Disk cache for persistent metadata across QGIS sessions
 # ---------------------------------------------------------------------------
 
-_DISK_CACHE_MAX_AGE = 7 * 24 * 3600  # 7 days
+_DISK_CACHE_FRESH_AGE = 3600  # 1 hour - serve from disk without HTTP
+_DISK_CACHE_MAX_AGE = 7 * 24 * 3600  # 7 days - hard eviction
 
 
 def _disk_cache_dir() -> str:
@@ -119,24 +120,25 @@ def _disk_cache_path(url: str) -> str:
     )
 
 
-def _disk_cache_read(url: str) -> Optional[Tuple[ZarrRootInfo, str, str]]:
-    """Read cached (info, etag, last_modified) from disk. None on miss."""
+def _disk_cache_read(url: str) -> Optional[Tuple[ZarrRootInfo, float]]:
+    """Read cached (info, age_seconds) from disk. None on miss."""
     path = _disk_cache_path(url)
     try:
+        age = time.time() - os.path.getmtime(path)
         with open(path) as f:
             obj = json.load(f)
         info = ZarrRootInfo.from_dict(obj["info"])
-        return info, obj.get("etag", ""), obj.get("last_modified", "")
+        return info, age
     except (OSError, KeyError, json.JSONDecodeError, TypeError):
         return None
 
 
-def _disk_cache_write(url: str, info: ZarrRootInfo, etag: str = "", last_modified: str = "") -> None:
-    """Write metadata to disk cache."""
+def _disk_cache_write(url: str, info: ZarrRootInfo) -> None:
+    """Write metadata to disk cache (always, regardless of server headers)."""
     path = _disk_cache_path(url)
     try:
         with open(path, "w") as f:
-            json.dump({"etag": etag, "last_modified": last_modified, "info": info.to_dict()}, f)
+            json.dump({"info": info.to_dict()}, f)
     except OSError as e:
         log.debug("Disk cache write failed for %s: %s", url, e)
 
@@ -172,130 +174,47 @@ _lock = threading.Lock()
 _disk_cache_evict()
 
 
-class _HttpResult:
-    """HTTP response with optional caching headers."""
 
-    __slots__ = ("data", "etag", "last_modified", "status")
-
-    def __init__(self, data: Optional[bytes], status: int = 200,
-                 etag: str = "", last_modified: str = ""):
-        self.data = data
-        self.status = status
-        self.etag = etag
-        self.last_modified = last_modified
-
-
-def _http_read(url: str, timeout: float = 15,
-               etag: str = "", last_modified: str = "") -> _HttpResult:
-    """Read a remote file via urllib with optional conditional GET.
-
-    Returns _HttpResult. On 304 Not Modified, data is None and status is 304.
-    """
+def _http_read(url: str, timeout: float = 10) -> Optional[bytes]:
+    """Single GET via urllib. Used for metadata JSON and thumbnails."""
     try:
         req = urllib.request.Request(url)
-        if etag:
-            req.add_header("If-None-Match", etag)
-        if last_modified:
-            req.add_header("If-Modified-Since", last_modified)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return _HttpResult(
-                data=resp.read(),
-                status=resp.status,
-                etag=resp.headers.get("ETag", ""),
-                last_modified=resp.headers.get("Last-Modified", ""),
-            )
-    except urllib.error.HTTPError as e:
-        if e.code == 304:
-            return _HttpResult(data=None, status=304)
-        return _HttpResult(data=None, status=e.code)
-    except (urllib.error.URLError, OSError, TimeoutError):
-        return _HttpResult(data=None, status=0)
-
-
-def _vsi_read(url: str) -> Optional[bytes]:
-    """Read a remote file. Uses urllib for http(s), GDAL vsicurl for s3/vsi."""
-    if url.startswith(("http://", "https://")):
-        result = _http_read(url)
-        return result.data
-    vsi_path = f"/vsicurl/{url}"
-    fp = gdal.VSIFOpenL(vsi_path, "rb")
-    if fp is None:
+            return resp.read()
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError, TimeoutError):
         return None
-    try:
-        buf = bytearray()
-        while True:
-            chunk = gdal.VSIFReadL(1, 65536, fp)
-            if not chunk:
-                break
-            buf.extend(chunk)
-    finally:
-        gdal.VSIFCloseL(fp)
-    return bytes(buf) if buf else None
-
-
-def _fetch_metadata_url(metadata_url: str, cached_etag: str = "",
-                        cached_lm: str = "") -> Tuple[Optional[bytes], str, str]:
-    """Fetch a metadata URL with conditional GET for HTTP.
-
-    Returns (data, etag, last_modified). data is None on 304 or failure.
-    """
-    if metadata_url.startswith(("http://", "https://")):
-        result = _http_read(metadata_url, etag=cached_etag, last_modified=cached_lm)
-        if result.status == 304:
-            return None, cached_etag, cached_lm
-        return result.data, result.etag, result.last_modified
-    # S3/VSI: no conditional GET support, always fetch
-    return _vsi_read(metadata_url), "", ""
 
 
 def fetch(zarr_url: str) -> Optional[ZarrRootInfo]:
     """Fetch and cache metadata (v3 zarr.json or v2 .zmetadata).
 
-    Uses a two-level cache: in-memory dict + persistent disk cache with
-    conditional GET (ETag/Last-Modified) to skip re-downloads.
+    Three-tier cache: in-memory -> disk (fresh < 1h) -> network.
+    v3 and v2 probed in parallel on cache miss. Always writes to disk.
     """
     url = zarr_url.rstrip("/")
 
+    # Tier 1: in-memory
     with _lock:
         if url in _cache:
             return _cache[url]
 
-    # Check disk cache for saved metadata + caching headers
+    # Tier 2: disk cache - serve fresh entries without any HTTP
     disk_hit = _disk_cache_read(url)
-    cached_etag = disk_hit[1] if disk_hit else ""
-    cached_lm = disk_hit[2] if disk_hit else ""
+    if disk_hit:
+        info, age = disk_hit
+        if age < _DISK_CACHE_FRESH_AGE:
+            log.debug("Disk cache fresh (%.0fs) for %s", age, url)
+            with _lock:
+                _cache[url] = info
+            return info
 
-    info = None
-    etag = ""
-    last_modified = ""
+    # Tier 3: network fetch (v3 + v2 probed in parallel)
+    info = _probe_metadata(url)
 
-    # Try Zarr v3 first
-    try:
-        data, etag, last_modified = _fetch_metadata_url(
-            f"{url}/zarr.json", cached_etag, cached_lm,
-        )
-        if data is None and disk_hit:
-            # 304 Not Modified - use disk cache
-            info = disk_hit[0]
-            log.debug("Disk cache hit (304) for %s", url)
-        elif data:
-            info = _parse(json.loads(data))
-    except (json.JSONDecodeError, OSError, KeyError) as e:
-        log.warning("Zarr v3 parse failed for %s: %s", url, e)
-
-    # Fall back to Zarr v2
-    if info is None:
-        try:
-            data, etag, last_modified = _fetch_metadata_url(
-                f"{url}/.zmetadata", cached_etag, cached_lm,
-            )
-            if data is None and disk_hit:
-                info = disk_hit[0]
-                log.debug("Disk cache hit (304) for %s", url)
-            elif data:
-                info = _parse_v2(json.loads(data))
-        except (json.JSONDecodeError, OSError, KeyError) as e:
-            log.warning("Zarr v2 parse failed for %s: %s", url, e)
+    if info is None and disk_hit:
+        # Network failed - serve stale cache rather than error
+        info = disk_hit[0]
+        log.debug("Serving stale cache for %s (network failed)", url)
 
     if info is None:
         log.debug("No zarr.json or .zmetadata found at %s", url)
@@ -303,15 +222,37 @@ def fetch(zarr_url: str) -> Optional[ZarrRootInfo]:
 
     with _lock:
         _cache[url] = info
-
-    # Persist to disk cache only if server supports conditional GET
-    if etag or last_modified:
-        _disk_cache_write(url, info, etag, last_modified)
-        log.debug("Disk cache write for %s (etag=%s)", url, bool(etag))
-    elif not disk_hit:
-        log.debug("Disk cache skip for %s (no ETag/Last-Modified)", url)
-
+    _disk_cache_write(url, info)
     return info
+
+
+def _probe_metadata(url: str) -> Optional[ZarrRootInfo]:
+    """Probe v3 zarr.json and v2 .zmetadata in parallel. First success wins."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _try_v3():
+        data = _http_read(f"{url}/zarr.json")
+        if data:
+            return _parse(json.loads(data))
+        return None
+
+    def _try_v2():
+        data = _http_read(f"{url}/.zmetadata")
+        if data:
+            return _parse_v2(json.loads(data))
+        return None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futs = {pool.submit(_try_v3): "v3", pool.submit(_try_v2): "v2"}
+        for fut in as_completed(futs, timeout=25):
+            try:
+                info = fut.result()
+                if info is not None:
+                    log.debug("Loaded %s metadata for %s", futs[fut], url)
+                    return info
+            except Exception as e:
+                log.debug("%s probe failed for %s: %s", futs[fut], url, e)
+    return None
 
 
 def clear_cache() -> None:
