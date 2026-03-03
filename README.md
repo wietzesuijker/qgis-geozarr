@@ -8,22 +8,21 @@ Load cloud-native Zarr data from any STAC catalog - pick the bands and resolutio
 
 **1. Install the plugin**
 
-Plugins > Manage and Install Plugins > Search "GeoZarr" > Install.
+Install from the [QGIS Plugin Repository](https://plugins.qgis.org/plugins/qgis_geozarr/): Plugins > Manage and Install Plugins > Search "GeoZarr" > Install.
 
 Or download `qgis_geozarr.zip` from [Releases](https://github.com/wietzesuijker/qgis-geozarr/releases) and install from ZIP.
 
 **2. Connect a STAC catalog**
 
-Open the QGIS Browser panel. Right-click "STAC" > New Connection and add a catalog:
+QGIS has a built-in STAC browser (3.40+). The plugin adds a **Load GeoZarr...** action to it.
 
-| Catalog | URL |
-|---------|-----|
-| EOPF Explorer | `https://api.explorer.eopf.copernicus.eu` |
-| EOPF Production | `https://stac.core.eopf.eodc.eu/api` |
+Open the Browser panel, right-click "STAC" > New Connection and add a catalog, e.g. `https://api.explorer.eopf.copernicus.eu/stac`.
 
 **3. Load data**
 
 Browse to a Zarr asset, right-click > **Load GeoZarr...**. Pick bands, choose a resolution, hit Load.
+
+![Load GeoZarr from STAC browser](docs/load-geozarr.png)
 
 Or skip STAC entirely: click the GeoZarr toolbar icon and paste any Zarr store URL.
 
