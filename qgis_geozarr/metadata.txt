@@ -17,11 +17,12 @@ tags=geozarr,zarr,stac,sentinel-2,landsat,copernicus,cloud-native,raster,multisc
 category=Raster
 hasProcessingProvider=no
 about=Right-click any Zarr asset in the QGIS STAC browser and load exactly the bands and resolution you need. Or paste a URL directly.
+    - Time series: search by tile, load as temporal layers, navigate with QGIS Temporal Controller (demo: https://github.com/wietzesuijker/qgis-geozarr#time-series-demo)
     - Band and resolution picker with satellite presets (Sentinel-2, Landsat, MODIS, Sentinel-3, including EOPF)
     - Multiscale pyramids from the multiscales convention - no extra downloads
     - Auto RGB styling with stretch defaults tuned per satellite and data type
     - Cloud-optimized out of the box (HTTP/2, parallel decode, connection pooling)
-    Zarr v2 (.zmetadata) and v3 (zarr.json), including sharded stores. Sharding requires GDAL 3.13 (not yet released, build from source).
+    Zarr v2 (.zmetadata) and v3 (zarr.json), including sharded stores. Sharding requires GDAL 3.13+. QGIS 3.44 ships this by default.
 
 changelog=
     0.2.0 - Time series
