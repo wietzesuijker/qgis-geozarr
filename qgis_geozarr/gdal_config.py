@@ -31,8 +31,12 @@ _ZARR_CONFIG: Dict[str, str] = {
     "GDAL_HTTP_MAX_TOTAL_CONNECTIONS": "20",
     "GDAL_NUM_THREADS": "ALL_CPUS",
     "GDAL_CACHEMAX": "512",
-    # Zarr v3: skip dir listing, small initial read
-    "GDAL_DISABLE_READDIR_ON_OPEN": "YES",
+    # Connection reuse
+    "GDAL_HTTP_TCP_KEEPALIVE": "YES",
+    # Zarr v3: skip dir listing + auxiliary file probing, small initial read
+    "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
+    # NOTE: Do NOT set CPL_VSIL_CURL_ALLOWED_EXTENSIONS - Zarr data chunks
+    # have no file extension and would be blocked.
     "GDAL_INGESTED_BYTES_AT_OPEN": "32768",
     # Shard index cache: 4 MiB per shard (default 1 MiB)
     "GDAL_ZARR_SHARD_INDEX_CACHE_MAX_BYTES": "4194304",

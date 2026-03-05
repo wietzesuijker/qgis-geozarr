@@ -45,7 +45,11 @@ class _FetchThread(QThread):
         self.url = url
 
     def run(self):
-        info, url = geozarr_metadata.fetch_resolved(self.url)
+        try:
+            info, url = geozarr_metadata.fetch_resolved(self.url)
+        except Exception as e:
+            log.warning("Fetch failed: %s", e, exc_info=True)
+            info, url = None, self.url
         self.finished.emit(info, url)
 
 
@@ -66,9 +70,13 @@ class GeoZarrPlugin:
         if (major, minor) < _MIN_GDAL:
             log.warning(
                 "GeoZarr: GDAL %d.%d detected, %d.%d+ required for Zarr v3 sharding",
-                major,
-                minor,
-                *_MIN_GDAL,
+                major, minor, *_MIN_GDAL,
+            )
+            self._iface.messageBar().pushMessage(
+                "GeoZarr",
+                f"GDAL {major}.{minor} detected - "
+                f"Zarr v3 sharding requires GDAL {_MIN_GDAL[0]}.{_MIN_GDAL[1]}+",
+                Qgis.MessageLevel.Warning, duration=10,
             )
 
         gdal_config.apply()
@@ -88,7 +96,7 @@ class GeoZarrPlugin:
             QIcon(icon_path), "Load GeoZarr URL...", self._toolbar
         )
         self._action.setToolTip(
-            "Load a GeoZarr dataset from a Zarr v3 URL"
+            "Load a GeoZarr dataset from a Zarr URL"
         )
         self._action.triggered.connect(self._load_from_url)
         self._toolbar.addAction(self._action)

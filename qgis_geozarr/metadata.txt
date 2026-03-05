@@ -3,7 +3,7 @@ name=GeoZarr
 qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
 description=Load cloud-native Zarr data from STAC: band selection, multiscale pyramids, satellite presets (Zarr v2 + v3)
-version=0.1.5
+version=0.2.0
 author=Wietze Suijker
 email=wietze.suijker@gmail.com
 icon=icon.svg
@@ -24,6 +24,11 @@ about=Right-click any Zarr asset in the QGIS STAC browser and load exactly the b
     Zarr v2 (.zmetadata) and v3 (zarr.json), including sharded stores. Sharding requires GDAL 3.13 (not yet released, build from source).
 
 changelog=
+    0.2.0 - Time series
+    - Browse STAC, select tile, load time series via right-click
+    - Native QGIS temporal controller with IrregularStep (3.36+)
+    - Progressive layer loading with VRT pre-warming
+    - Calendar-day dedup, satellite band presets, auto-style
     0.1.5 - Clarify GDAL 3.13 requirement, fix unused imports
     - About: note sharding needs GDAL 3.13 (build from source until release)
     0.1.4 - Fast metadata loading

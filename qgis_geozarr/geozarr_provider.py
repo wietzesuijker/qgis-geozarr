@@ -33,6 +33,7 @@ from qgis.PyQt.QtWidgets import QAction, QApplication, QDialog, QMessageBox
 
 from . import geozarr_metadata
 from .geozarr_dialog import GeoZarrLoadDialog
+from .stac_search import _extract_zarr_href, _find_zarr_root
 
 TAG = "GeoZarr"
 log = logging.getLogger(__name__)
@@ -63,14 +64,6 @@ def cleanup_temp_files() -> None:
 
 
 atexit.register(cleanup_temp_files)
-
-
-def _find_zarr_root(url: str) -> str:
-    """Find the Zarr store root from a deep asset URL."""
-    m = re.search(r"(https?://[^?#]*\.zarr)", url)
-    if m:
-        return m.group(1)
-    return url
 
 
 def _clean_gdal_uri(raw: str) -> str:
@@ -114,18 +107,6 @@ def _fetch_stac_item_json(stac_item_url: str) -> dict:
             f"STAC item fetch failed for {stac_item_url}: {e}", TAG, Qgis.Warning,
         )
     return {}
-
-
-def _extract_zarr_href(assets: dict) -> tuple:
-    """Find Zarr asset href from STAC item assets. Returns (url, key)."""
-    for key, asset in assets.items():
-        if not isinstance(asset, dict):
-            continue
-        href = asset.get("href", "")
-        media = asset.get("type", "")
-        if "zarr" in media.lower() or ".zarr" in href.lower():
-            return (_find_zarr_root(href), key)
-    return ("", "")
 
 
 def _fetch_zarr_href(stac_item_url: str) -> tuple:
@@ -192,7 +173,12 @@ class _ProviderFetchThread(QThread):
             thumb_url = _extract_thumbnail_url(item)
 
         t_pre_meta = _time.monotonic()
-        info, url = geozarr_metadata.fetch_resolved(zarr_url)
+        try:
+            info, url = geozarr_metadata.fetch_resolved(zarr_url)
+        except Exception as e:
+            log.warning("fetch_resolved failed: %s", e, exc_info=True)
+            self.finished.emit(None, zarr_url)
+            return
         t_meta = _time.monotonic()
         log.debug("Metadata fetch: %.2fs", t_meta - t_pre_meta)
 
@@ -262,6 +248,7 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
         self._pending = {}
         self._pending_thumbnail = None
         self._pending_dialog = None
+        self._ts_controller = None
 
     def name(self) -> str:
         return "GeoZarr"
@@ -273,6 +260,12 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
         action = QAction("Load GeoZarr...", menu)
         action.triggered.connect(lambda: self._load_geozarr(item, zarr_url))
         menu.addAction(action)
+
+        # Time series option for STAC items
+        if zarr_url.startswith("STAC:"):
+            ts_action = QAction("Load Time Series...", menu)
+            ts_action.triggered.connect(lambda: self._load_timeseries(item))
+            menu.addAction(ts_action)
 
         # Speculative prefetch: start STAC + zarr.json fetch NOW while
         # user reads the context menu. Caches populate before click.
@@ -551,6 +544,89 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
             QApplication.restoreOverrideCursor()
             self._msg_clear()
 
+    def _load_timeseries(self, item: QgsDataItem) -> None:
+        """Open time series dialog for a STAC item."""
+        from .stac_search import extract_grid_code
+        from .timeseries import TimeSeriesState
+        from .timeseries_dialog import TimeSeriesDialog
+
+        ctx = self._build_stac_context(item)
+        if not ctx:
+            _error_dialog("Could not resolve STAC context for this item.")
+            return
+
+        # Extract grid code from current STAC item (for tile filtering)
+        # Fast path: use cache from speculative prefetch (avoids main-thread HTTP)
+        item_url = ctx.get("item_url", "")
+        with _stac_cache_lock:
+            stac_item = _stac_cache.get(item_url)
+        if stac_item is None:
+            stac_item = _fetch_stac_item_json(item_url)
+        grid_code = extract_grid_code(stac_item) if stac_item else ""
+
+        # Extract bbox from STAC item geometry
+        bbox = None
+        if stac_item:
+            raw_bbox = stac_item.get("bbox")
+            if raw_bbox and len(raw_bbox) >= 4:
+                bbox = tuple(raw_bbox[:4])
+
+        collection_id = ctx.get("collection_id", "")
+        dlg = TimeSeriesDialog(
+            parent=None,
+            base_url=ctx.get("base_url", ""),
+            collection_id=collection_id,
+            default_bbox=bbox,
+            default_grid_code=grid_code,
+        )
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        info, items = dlg.search_results()
+        if not info or not items:
+            _error_dialog("No search results available.")
+            return
+
+        bands = dlg.selected_bands()
+        if not bands:
+            _error_dialog("No bands selected.")
+            return
+
+        from . import band_presets
+        satellite = band_presets.detect_satellite(collection_id) if collection_id else ""
+
+        state = TimeSeriesState(
+            items=items,
+            info=info,
+            bands=bands,
+            resolution=dlg.selected_resolution(),
+            satellite=satellite,
+            stretch_range=dlg.stretch_range(),
+        )
+
+        # Clean up previous time series if any
+        if self._ts_controller:
+            self._ts_controller.cleanup()
+            self._ts_controller = None
+
+        self._msg("Loading time series...")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()
+        try:
+            from .timeseries import TimeSeriesController
+            controller = TimeSeriesController(state, self._iface)
+            controller.start()
+            self._ts_controller = controller
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._msg_clear()
+
+        self._msg(
+            f"Time series loaded: {controller.count} dates",
+            duration=5,
+        )
+
     @staticmethod
     def _validate_fetch_result(info, zarr_url) -> bool:
         """Check fetch result and show error dialog if invalid. Returns True if OK."""
@@ -605,15 +681,19 @@ class GeoZarrDataItemGuiProvider(QgsDataItemGuiProvider):
         """Safely disconnect a QThread's signals to prevent stale callbacks."""
         if thread is None:
             return
-        try:
-            thread.finished.disconnect()
-        except (RuntimeError, TypeError):
-            pass
+        for sig_name in ("finished", "thumbnail_ready"):
+            try:
+                getattr(thread, sig_name).disconnect()
+            except (RuntimeError, TypeError, AttributeError):
+                pass
 
     def stop_fetch(self) -> None:
-        """Cancel any running fetch thread."""
+        """Cancel any running fetch thread and clean up time series."""
         self._cleanup_fetch_thread()
         self._fetch_thread = None
+        if self._ts_controller:
+            self._ts_controller.cleanup()
+            self._ts_controller = None
 
 
 def _vsi_prefix(url: str) -> str:
