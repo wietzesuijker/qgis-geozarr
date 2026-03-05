@@ -18,7 +18,6 @@ import urllib.request
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from osgeo import gdal
 
 log = logging.getLogger(__name__)
 

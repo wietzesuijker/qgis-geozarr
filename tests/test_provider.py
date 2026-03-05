@@ -27,7 +27,6 @@ for mod_name, mod in [
 ]:
     sys.modules.setdefault(mod_name, mod)
 
-import pytest  # noqa: E402
 
 from qgis_geozarr.geozarr_provider import (  # noqa: E402
     _band_uri,
@@ -134,7 +133,6 @@ class TestPrewarmLogging:
     """Test that pre-warm logs warnings on failure."""
 
     def test_prewarm_logs_failure(self, monkeypatch):
-        import logging
         from qgis_geozarr.geozarr_provider import _ProviderFetchThread
         from qgis_geozarr.geozarr_metadata import ZarrRootInfo
 

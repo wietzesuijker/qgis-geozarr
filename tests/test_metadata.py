@@ -1,10 +1,8 @@
 """Tests for geozarr_metadata parsing (v2 + v3) and disk cache."""
 
-import json
 import os
 import time
 
-import pytest
 
 from qgis_geozarr.geozarr_metadata import (
     ZarrRootInfo,

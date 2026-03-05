@@ -2,7 +2,6 @@
 
 import pytest
 
-from qgis_geozarr.geozarr_metadata import ZarrRootInfo
 
 
 @pytest.fixture
