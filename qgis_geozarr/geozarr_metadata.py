@@ -169,8 +169,10 @@ def _res_sort_key(name: str) -> int:
 _cache: Dict[str, ZarrRootInfo] = {}
 _lock = threading.Lock()
 
-# Evict stale disk cache entries on module load
-_disk_cache_evict()
+# Evict stale disk cache entries after a short delay (not at import time)
+_evict_timer = threading.Timer(5.0, _disk_cache_evict)
+_evict_timer.daemon = True
+_evict_timer.start()
 
 
 
@@ -248,6 +250,10 @@ def _probe_metadata(url: str) -> Optional[ZarrRootInfo]:
                 info = fut.result()
                 if info is not None:
                     log.debug("Loaded %s metadata for %s", futs[fut], url)
+                    # Cancel the other future if it hasn't started yet
+                    for other in futs:
+                        if other is not fut:
+                            other.cancel()
                     return info
             except Exception as e:
                 log.debug("%s probe failed for %s: %s", futs[fut], url, e)

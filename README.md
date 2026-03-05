@@ -26,8 +26,19 @@ Browse to a Zarr asset, right-click > **Load GeoZarr...**. Pick bands, choose a 
 
 Or skip STAC entirely: click the GeoZarr toolbar icon and paste any Zarr store URL.
 
+**4. Load a time series**
+
+Right-click a STAC item > **Load Time Series...**. The plugin searches for all acquisitions of the same tile, loads them as temporal layers, and opens the QGIS Temporal Controller for frame-by-frame navigation.
+
+<img src="docs/load-geozarr-timeseries.png" alt="Load time series from STAC" width="400">
+
+## Time series demo
+
+https://github.com/user-attachments/assets/6be1e202-82de-4955-bcb6-7fdb8bed9e08
+
 ## Features
 
+- **Time series** - STAC search by tile, native QGIS temporal controller (IrregularStep), progressive loading
 - **Band and resolution picker** with satellite presets (Sentinel-2, Landsat 8/9, MODIS, Sentinel-3)
 - **Multiscale pyramids** from the multiscales convention - smooth zoom without extra downloads
 - **Auto RGB styling** with stretch defaults tuned per satellite and data type
@@ -42,7 +53,7 @@ Or skip STAC entirely: click the GeoZarr toolbar icon and paste any Zarr store U
 ## Development
 
 ```bash
-make test    # 78 tests
+make test    # 110 tests
 make lint    # ruff check
 make zip     # build plugin zip
 ```
